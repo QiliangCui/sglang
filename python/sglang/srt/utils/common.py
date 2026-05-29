@@ -2049,7 +2049,12 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "mps"
         return "mps:{}".format(device_id)
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available.")
+    if is_tpu():
+        if device_id is None:
+            return "tpu"
+        return "tpu:{}".format(device_id)
+
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS, TPU) is available.")
 
 
 @lru_cache(maxsize=1)
@@ -2119,6 +2124,12 @@ def get_compiler_backend(mode=None) -> str:
 
     if current_platform.is_out_of_tree():
         return current_platform.get_compile_backend(mode)
+
+    # In-tree TPU: torch.compile is replaced with identity in
+    # TpuSRTPlatform.init_backend(); "eager" is a safety net for any call
+    # site that has imported the backend name before init_backend runs.
+    if is_tpu():
+        return "eager"
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
