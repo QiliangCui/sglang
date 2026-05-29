@@ -177,6 +177,14 @@ class JaxAttentionBackend(AttentionBackend):
 
         # query_start_loc: cumsum of extend_seq_lens for extend, or
         # arange-like for decode.
+        # request_distribution: per tpu_inference.runner.tpu_runner:1782-1785
+        # the format is [num_decode, num_decode, num_total_reqs].
+        # Decode seqs are those with num_scheduled_tokens == 1; everything
+        # else (including extend / chunked-prefill) is "non-decode".
+        # Plan §13 / kb-tpu §3.3 named this triple (decode_end, prefill_end,
+        # mixed_end) — that's correct semantically, but prefill_end ==
+        # decode_end in tpu-inference's runner because the kernel treats
+        # any non-decode seq as "extend-style".
         if forward_batch.forward_mode.is_extend():
             ext = _to_jax(forward_batch.extend_seq_lens).astype(jnp.int32)
             qsl = jnp.concatenate(
@@ -186,8 +194,7 @@ class JaxAttentionBackend(AttentionBackend):
             if qsl.shape[0] < batch_size + 1:
                 qsl = jnp.pad(qsl, (0, batch_size + 1 - qsl.shape[0]),
                               constant_values=int(qsl[-1]))
-            distribution = jnp.array([0, batch_size, batch_size],
-                                     dtype=jnp.int32)
+            distribution = jnp.array([0, 0, batch_size], dtype=jnp.int32)
         else:
             # decode: each seq contributes exactly 1 token
             qsl = jnp.arange(batch_size + 1, dtype=jnp.int32)
