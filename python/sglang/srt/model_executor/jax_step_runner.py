@@ -26,6 +26,7 @@ don't import torchax.
 """
 from __future__ import annotations
 
+import bisect
 import logging
 from typing import TYPE_CHECKING, Optional
 
@@ -37,6 +38,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Token-padding buckets for extend mode. Mirrors tpu-inference's
+# `runner.utils.get_token_paddings(min=16, max=...)` policy: powers of 2
+# until 64, then 64-token gaps. Decode mode always uses num_tokens=1, so
+# no bucket needed for it.
+#
+# Each unique bucket → one JIT compile (~6s for full Qwen3-4B). The list
+# is intentionally short for MVP: small prompts trigger the lower
+# buckets; production with longer contexts would extend up.
+_EXTEND_TOKEN_BUCKETS: list[int] = [16, 32, 64, 128, 256, 512, 1024]
+
+
+def _bucket_extend_tokens(n: int) -> int:
+    """Round n up to the smallest bucket >= n. Raises if n is too big."""
+    idx = bisect.bisect_left(_EXTEND_TOKEN_BUCKETS, n)
+    if idx >= len(_EXTEND_TOKEN_BUCKETS):
+        raise ValueError(
+            f"extend num_tokens={n} exceeds max bucket "
+            f"{_EXTEND_TOKEN_BUCKETS[-1]}; extend the bucket list."
+        )
+    return _EXTEND_TOKEN_BUCKETS[idx]
+
 
 class JaxStepRunner:
     """Single-JIT step runner."""
@@ -44,9 +66,9 @@ class JaxStepRunner:
     def __init__(self, model_runner: "ModelRunner"):
         self.model_runner = model_runner
         self.model = model_runner.model
-        # Cached JIT compiled step_fun per (forward_mode_str, num_tokens,
-        # batch_size). Production needs proper bucketing; this is good
-        # enough for S3.4 first-pass + spike runs.
+        # Cached JIT compiled step_fun per (mode, bucket_num_tokens,
+        # batch_size). After bucketing, all extend calls within the same
+        # bucket reuse a single compile.
         self._step_jits: dict = {}
         # Cached pytree of jax-view'd model params (built once).
         self._params_jax = None
@@ -121,25 +143,44 @@ class JaxStepRunner:
     def step(self, forward_batch: "ForwardBatch") -> torch.Tensor:
         """Single entry point for decode + extend forward.
 
+        Pads `input_ids` and `positions` up to the next bucket so the
+        JIT cache is keyed by bucket size, not raw token count. The
+        underlying `extend_seq_lens` / `seq_lens` keep the REAL token
+        count — the RPA kernel uses those to mask out padded queries
+        from KV cache writes and from attention output that gets
+        sampled.
+
         Returns the model output (`LogitsProcessorOutput` for generation,
         embedding pooler output otherwise). Mutates internal kv_caches.
         """
         import jax
+        import jax.numpy as jnp
         from torchax.interop import jax_view, torch_view
-
-        from sglang.srt.model_executor.forward_context import forward_context
-        from sglang.srt.model_executor.jax_forward_context import (
-            JaxForwardContext, set_jax_forward_context,
-        )
 
         self._ensure_setup(forward_batch)
 
-        # Build / fetch the JIT for this shape.
         mode = forward_batch.forward_mode
-        mode_key = "extend" if mode.is_extend() else "decode"
-        num_tokens = forward_batch.input_ids.shape[0]
+        is_extend = mode.is_extend()
+        mode_key = "extend" if is_extend else "decode"
+        real_num_tokens = forward_batch.input_ids.shape[0]
         batch_size = forward_batch.batch_size
-        cache_key = (mode_key, num_tokens, batch_size)
+
+        # Bucket choice. Decode is always 1 token per seq → bucket = batch_size.
+        if is_extend:
+            bucket_num_tokens = _bucket_extend_tokens(real_num_tokens)
+        else:
+            bucket_num_tokens = real_num_tokens
+        cache_key = (mode_key, bucket_num_tokens, batch_size)
+
+        # Pad input_ids and positions to bucket_num_tokens, holding the
+        # underlying forward_batch otherwise intact (extend_seq_lens etc.
+        # still reflect real token counts → kernel writes only real K/V).
+        ji_jax = jax_view(forward_batch.input_ids).astype(jnp.int32)
+        pj_jax = jax_view(forward_batch.positions).astype(jnp.int32)
+        pad = bucket_num_tokens - real_num_tokens
+        if pad > 0:
+            ji_jax = jnp.pad(ji_jax, (0, pad))
+            pj_jax = jnp.pad(pj_jax, (0, pad))
 
         if cache_key not in self._step_jits:
             self._step_jits[cache_key] = self._build_step_jit(
@@ -147,12 +188,8 @@ class JaxStepRunner:
             )
         step_jit = self._step_jits[cache_key]
 
-        # Pull inputs as jax arrays.
-        ji = jax_view(forward_batch.input_ids)
-        pj = jax_view(forward_batch.positions)
-
         logits_jax, new_kv = step_jit(
-            self._params_jax, self._kv_caches, ji, pj
+            self._params_jax, self._kv_caches, ji_jax, pj_jax
         )
         # Donation freed the prior list; rebind so next call sees the new state.
         self._kv_caches = list(new_kv)
