@@ -661,7 +661,7 @@ def get_available_gpu_memory(
     else:
         from sglang.srt.platforms import current_platform
 
-        if not current_platform.is_out_of_tree():
+        if not (current_platform.is_out_of_tree() or current_platform.is_tpu()):
             raise ValueError(
                 f"Unsupported device type: {device!r}. "
                 "If this is an OOT platform, ensure it is properly registered "
