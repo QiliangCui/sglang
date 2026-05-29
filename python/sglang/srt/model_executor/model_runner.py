@@ -236,6 +236,13 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+import sys as _sys
+_sys.stderr.write(
+    f"[model_runner module-import] current_platform="
+    f"{type(current_platform).__name__} is_tpu={current_platform.is_tpu()} "
+    f"is_oot={current_platform.is_out_of_tree()} _is_npu={_is_npu}\n"
+)
+_sys.stderr.flush()
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 

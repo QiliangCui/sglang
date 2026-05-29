@@ -168,3 +168,10 @@ def apply(server_args) -> None:
         logger.info("TPU: rewriting server_args.device 'tpu' -> 'jax' "
                     "(torch.device('tpu') not accepted on torch 2.11).")
         server_args.device = "jax"
+
+    # Make the TPU choice sticky across spawned child processes — the
+    # platform's auto-detect probe (jax.devices()) can fail in worker
+    # processes where libtpu hasn't been initialized yet. Setting this
+    # env var in the parent makes spawned workers force TPU.
+    import os as _os
+    _os.environ["SGLANG_FORCE_TPU"] = "1"

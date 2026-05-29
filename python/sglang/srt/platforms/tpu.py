@@ -185,6 +185,14 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
     def init_backend(self) -> None:
         """One-time per-worker setup. Runs at the first call site that
         touches `current_platform.init_backend()` (model_runner import).
+        """
+        import sys as _sys
+        _sys.stderr.write("[TpuSRTPlatform.init_backend] firing\n")
+        _sys.stderr.flush()
+        return self._init_backend_inner()
+
+    def _init_backend_inner(self) -> None:
+        """Actual body. Wrapped so we can verify firing from logs.
 
         Order matters:
           1. Pin cache env vars (so child workers inherit them even if the

@@ -105,6 +105,16 @@ def _resolve_platform() -> SRTPlatform:
             logger.exception("Failed to activate platform plugin: %s", name)
 
     if len(activated) == 0:
+        # TPU first — env var SGLANG_FORCE_TPU=1 bypasses jax.devices() probe,
+        # which fails in some spawned scheduler workers where libtpu hasn't
+        # been initialized yet. The parent always inits it.
+        import os as _os
+        if _os.environ.get("SGLANG_FORCE_TPU") == "1" or is_tpu_available():
+            logger.debug(
+                "Using TPU SRTPlatform "
+                "(SGLANG_FORCE_TPU=1 or jax.devices() reports a TpuDevice)."
+            )
+            return TpuSRTPlatform()
         if _is_cuda_available():
             logger.debug(
                 "No platform plugin detected. Using CUDA SRTPlatform defaults."
@@ -115,12 +125,6 @@ def _resolve_platform() -> SRTPlatform:
                 "No platform plugin detected. Using ROCm SRTPlatform defaults."
             )
             return RocmSRTPlatform()
-        if is_tpu_available():
-            logger.debug(
-                "No platform plugin detected. Using TPU SRTPlatform "
-                "(jax.devices() reports a TpuDevice)."
-            )
-            return TpuSRTPlatform()
         logger.debug("No platform detected. Using base SRTPlatform.")
         return SRTPlatform()
 
