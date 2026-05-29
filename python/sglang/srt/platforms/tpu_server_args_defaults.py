@@ -156,3 +156,15 @@ def apply(server_args) -> None:
     # Multimodal rejection lives in TpuSRTPlatform.check_and_update_config
     # if we add that hook; for now we rely on the runtime path failing
     # cleanly at vision-encoder import. (kb §13 row 3.5 / risk #23)
+
+    # --- internal device-name rewrite: "tpu" -> "jax" ------------------
+    # `torch.device("tpu")` raises on torch 2.11 (allow-list excludes it).
+    # torchax has already claimed PrivateUse1 as "jax", so torch.device(
+    # "jax") works. Rewrite once here so the 11 `torch.device(self.device)`
+    # call sites in sglang core don't need per-site patches. User-facing
+    # CLI flag stays --device tpu; internal name is "jax".
+    # See decisions/2026-05-30_rewrite-device-to-jax-internally.md.
+    if server_args.device == "tpu":
+        logger.info("TPU: rewriting server_args.device 'tpu' -> 'jax' "
+                    "(torch.device('tpu') not accepted on torch 2.11).")
+        server_args.device = "jax"

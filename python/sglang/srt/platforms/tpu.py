@@ -222,6 +222,18 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
 
         torch.compile = _no_compile
 
+        # 2.5 Import torchax so PrivateUse1 gets renamed to "jax" (torchax
+        #     __init__ does this on import). After this point, torch.device(
+        #     "jax") returns a valid device, which the rest of the runtime
+        #     (DeviceConfig, dp_attention, model_runner) relies on after
+        #     apply_server_args_defaults rewrote 'tpu' -> 'jax'.
+        #
+        #     Per risk #34, doing this in the parent process is risky if the
+        #     parent then forks workers — but the engine uses spawn (not
+        #     fork) so worker processes get a clean torch state. In-process
+        #     testing (S2, S3.0 spike) also calls init_backend exactly once.
+        import torchax  # noqa: F401
+
         # 3. Device-module alias for "tpu". torch 2.11 won't let us call
         #    `torch._register_device_module("tpu", ...)` — its torch.device()
         #    constructor allow-list doesn't include "tpu", and torchax has

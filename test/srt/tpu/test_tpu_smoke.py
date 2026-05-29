@@ -69,7 +69,10 @@ def test_platform_memory_queries_return_something():
 
 def test_serverargs_applies_tpu_defaults():
     sa = _make_server_args([])
-    assert sa.device == "tpu"
+    # device rewritten 'tpu' -> 'jax' inside apply_server_args_defaults
+    # so torch.device(server_args.device) works on torch 2.11.
+    # See decisions/2026-05-30_rewrite-device-to-jax-internally.md.
+    assert sa.device == "jax"
     assert sa.dtype == "bfloat16"
     assert sa.kv_cache_dtype == "bfloat16"
     assert sa.attention_backend == "jax"

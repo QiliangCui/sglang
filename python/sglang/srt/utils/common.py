@@ -2050,9 +2050,12 @@ def get_device(device_id: Optional[int] = None) -> str:
         return "mps:{}".format(device_id)
 
     if is_tpu():
+        # Internal canonical device name is "jax" — torchax claims
+        # PrivateUse1 as "jax" so torch.device("jax") works; "tpu" would
+        # fail torch 2.11's allow-list. See decisions/2026-05-30...
         if device_id is None:
-            return "tpu"
-        return "tpu:{}".format(device_id)
+            return "jax"
+        return "jax:{}".format(device_id)
 
     raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS, TPU) is available.")
 

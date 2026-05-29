@@ -5,7 +5,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_DEVICES = ["cuda", "xpu", "hpu", "cpu", "npu", "musa", "mps", "tpu"]
+SUPPORTED_DEVICES = ["cuda", "xpu", "hpu", "cpu", "npu", "musa", "mps", "tpu", "jax"]
 
 
 class DeviceConfig:
