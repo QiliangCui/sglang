@@ -1306,10 +1306,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
             self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
         )
+        # TPU: wrap model load in torchax.default_env() so torch ops
+        # (torch.empty, torch.zeros, etc.) inside the model __init__
+        # dispatch to JAX. Without this, every parameter alloc raises
+        # "Could not run 'aten::empty.memory_format' from the 'jax' backend".
+        import contextlib
+        if current_platform.is_tpu():
+            import torchax
+            _load_ctx = torchax.default_env()
+        else:
+            _load_ctx = contextlib.nullcontext()
         with self.memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
-        ):
+        ), _load_ctx:
             self.loader = get_model_loader(
                 load_config=self.load_config,
                 model_config=self.model_config,
