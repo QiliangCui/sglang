@@ -29,19 +29,19 @@ from sglang.srt.platforms.interface import SRTPlatform
 
 
 def is_tpu_available() -> bool:
-    """Best-effort probe — return True iff jax.devices() reports a TpuDevice.
+    """Best-effort probe — does this host have a TPU?
 
     Called from `platforms/__init__.py:_resolve_platform()` device-probe
-    fallback. We import jax lazily so non-TPU hosts don't pay the cost.
+    fallback. We MUST NOT initialise libtpu in this probe — the parent
+    process touching libtpu locks it out for scheduler-worker subprocesses
+    (`ABORTED: Internal error when accessing libtpu multi-process lockfile`).
+
+    Instead we check `/dev/vfio/0` (TPU device file exposed by the kernel
+    driver on GCP TPU VMs). That's a stat-only check; no JAX/libtpu init.
     """
-    try:
-        import jax
-    except ImportError:
-        return False
-    try:
-        return any(d.platform == "tpu" for d in jax.devices())
-    except Exception:
-        return False
+    import os
+
+    return os.path.exists("/dev/vfio/0")
 
 
 class TpuDeviceMixin(DeviceMixin):
