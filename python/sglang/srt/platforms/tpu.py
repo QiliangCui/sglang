@@ -187,7 +187,8 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
         touches `current_platform.init_backend()` (model_runner import).
         """
         import sys as _sys
-        _sys.stderr.write("[TpuSRTPlatform.init_backend] firing\n")
+        import os as _os
+        _sys.stderr.write(f"[TpuSRTPlatform.init_backend] firing pid={_os.getpid()} ppid={_os.getppid()}\n")
         _sys.stderr.flush()
         return self._init_backend_inner()
 
