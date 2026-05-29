@@ -176,14 +176,15 @@ def is_npu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_tpu() -> bool:
-    """Detect a TPU host via jax.devices() (torchax-only; we do not poll
-    torch.tpu since torchax claims PrivateUse1 as "jax" not "tpu")."""
-    try:
-        import jax
+    """Detect a TPU host via /dev/vfio/0 (cheap, no libtpu touch).
 
-        return any(d.platform == "tpu" for d in jax.devices())
-    except Exception:
-        return False
+    Calling `jax.devices()` here would (a) initialise libtpu in every
+    process that imports a sglang module, racing scheduler workers
+    against each other, and (b) miss when JAX_PLATFORMS=cpu is set in
+    the env for non-model workers."""
+    import os
+
+    return os.path.exists("/dev/vfio/0")
 
 
 @lru_cache(maxsize=1)

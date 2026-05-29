@@ -520,10 +520,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_threads_binding()
 
         # TPU: init_backend was deferred from model_runner module-import to
-        # here so it only fires in the worker process (not the parent that
-        # spawned us). This is required so the parent doesn't claim
-        # /dev/vfio/* TPU devices the worker needs.
+        # here so it only fires in the worker process that actually loads
+        # the model (scheduler). Parent and non-model workers (tokenizer,
+        # detokenizer, router) keep JAX_PLATFORMS=cpu so they don't claim
+        # /dev/vfio/* — otherwise multiple workers race for the same
+        # devices and fail with "Device or resource busy".
         if current_platform.is_tpu():
+            import os as _os
+            if _os.environ.get("JAX_PLATFORMS") == "cpu":
+                del _os.environ["JAX_PLATFORMS"]
             current_platform.init_backend()
 
         # Get available memory before model loading
@@ -840,8 +845,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
 
-        # Initialize piecewise CUDA graph
-        self.init_piecewise_cuda_graphs()
+        # Initialize piecewise CUDA graph (skipped on TPU — support
+        # disabled by current_platform.support_piecewise_cuda_graph and
+        # the call itself would torch.zeros(device='jax') outside
+        # default_env).
+        if not current_platform.is_tpu():
+            self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
 

@@ -26,6 +26,24 @@ class _NoOpStream:
         pass
 
 
+class _NoOpStreamContext:
+    """No-op replacement for torch.cuda.StreamContext.
+
+    Scheduler.run_event_loop wraps its main loop in
+    `device_module.StreamContext(self.schedule_stream)`. We don't have
+    streams on TPU — XLA serialises per-device — so this just yields.
+    """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class TpuDeviceModule:
     def __init__(self):
         import torchax
@@ -48,3 +66,6 @@ class TpuDeviceModule:
 
     def stream(self, ctx=None):
         return _NoOpStream()
+
+    # Scheduler uses this as a context-manager class.
+    StreamContext = _NoOpStreamContext

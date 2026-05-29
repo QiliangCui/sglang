@@ -1,14 +1,8 @@
 # SGLang public APIs
 
-# TPU worker bootstrap: if the parent set JAX_PLATFORMS=cpu (so it could
-# avoid initializing libtpu) and we're a spawned child process (different
-# PID), force JAX_PLATFORMS=tpu so our jax inits TPU.
-# This MUST run before any `import jax` anywhere in the chain.
-import os as _os
-if (_os.environ.get("SGLANG_TPU_PARENT_PID")
-        and _os.environ.get("SGLANG_TPU_PARENT_PID") != str(_os.getpid())):
-    _os.environ["JAX_PLATFORMS"] = "tpu"
-del _os
+# NOTE: spawned workers inherit JAX_PLATFORMS=cpu from the parent.
+# Tokenizer / Detokenizer / Router never need TPU and should keep it.
+# Only ModelRunner.__init__ flips it to 'tpu' (see model_runner.py).
 
 # Install stubs early for platforms where certain dependencies are unavailable
 # (e.g. macOS/MPS has no triton, and torch.mps lacks Stream / set_device /

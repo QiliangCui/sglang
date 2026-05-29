@@ -151,6 +151,14 @@ def apply(server_args) -> None:
         # don't raise if user explicitly set it; just silently turn it on.
         server_args.disable_cuda_graph = True
 
+    # --- overlap schedule: forced off ----------------------------------
+    # Scheduler.init_overlap creates a FutureMap which does
+    # torch.empty(device='jax') outside default_env → NotImplementedError.
+    # Overlap requires CUDA stream primitives we don't have on TPU.
+    if not getattr(server_args, "disable_overlap_schedule", False):
+        logger.info("TPU: disabling overlap schedule (requires CUDA streams).")
+        server_args.disable_overlap_schedule = True
+
     # --- multimodal arch rejection -------------------------------------
     # The model_config is built later, so we cannot inspect arch here.
     # Multimodal rejection lives in TpuSRTPlatform.check_and_update_config
@@ -181,4 +189,4 @@ def apply(server_args) -> None:
     # Force parent to skip TPU init by routing jax to CPU. The worker
     # subprocess clears this env-var early (see sglang/__init__.py
     # bootstrap) so its jax inits TPU normally.
-    _os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    _os.environ["JAX_PLATFORMS"] = "cpu"
