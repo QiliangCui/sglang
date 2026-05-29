@@ -253,61 +253,27 @@ class JaxAttentionBackend(AttentionBackend):
             )
         kv_cache = ctx.kv_caches[layer_idx]
 
-        # DEBUG path: route through SDPA-equivalent jax kernel to bisect.
-        # If DEBUG_SDPA=1, use jax.nn.scaled_dot_product_attention; this
-        # validates the wrapping (jax_view / torch_view, GQA tiling, etc)
-        # without invoking the RPA kernel + AttentionMetadata path.
-        import os as _os
-        if _os.environ.get("DEBUG_JAX_SDPA") == "1":
-            import jax.numpy as jnp
-            n_kv_local = k.shape[1]
-            if n_q != n_kv_local:
-                rep = n_q // n_kv_local
-                k_rep = jax_view(k.repeat_interleave(rep, dim=1))
-                v_rep = jax_view(v.repeat_interleave(rep, dim=1))
-            else:
-                k_rep = jax_view(k)
-                v_rep = jax_view(v)
-            q_jax = jax_view(q)
-            q4 = jnp.expand_dims(jnp.transpose(q_jax, (1, 0, 2)), 0)
-            k4 = jnp.expand_dims(jnp.transpose(k_rep, (1, 0, 2)), 0)
-            v4 = jnp.expand_dims(jnp.transpose(v_rep, (1, 0, 2)), 0)
-            scores = jnp.einsum("bhqd,bhkd->bhqk", q4, k4) * float(layer.scaling)
-            seq = q.shape[0]
-            mask = jnp.triu(jnp.full((seq, seq), -jnp.inf), k=1)
-            scores = scores + mask
-            attn = jax.nn.softmax(scores, axis=-1)
-            output = jnp.einsum("bhqk,bhkd->bhqd", attn, v4)
-            output = jnp.transpose(jnp.squeeze(output, 0), (1, 0, 2))
-            # leave kv_cache unchanged; ctx already has it.
-        else:
-            md = self._build_metadata(forward_batch)
+        md = self._build_metadata(forward_batch)
 
-            # jax_view: torch.Tensor (torchax) -> jax.Array (zero-copy).
-            q_jax = jax_view(q)
-            k_jax = jax_view(k)
-            v_jax = jax_view(v)
+        # jax_view: torch.Tensor (torchax) -> jax.Array (zero-copy).
+        q_jax = jax_view(q)
+        k_jax = jax_view(k)
+        v_jax = jax_view(v)
 
-            _scale_override = _os.environ.get("DEBUG_RPA_SCALE")
-            _scale = layer.scaling if not _scale_override else (
-                None if _scale_override == "none" else float(_scale_override)
+        with self.mesh:
+            new_kv, output = attention(
+                kv_cache=kv_cache,
+                q=q_jax,
+                k=k_jax,
+                v=v_jax,
+                attention_metadata=md,
+                mesh=self.mesh,
+                sm_scale=layer.scaling,
             )
-            _update_kv = _os.environ.get("DEBUG_RPA_UPDATE_KV", "1") == "1"
-            with self.mesh:
-                new_kv, output = attention(
-                    kv_cache=kv_cache,
-                    q=q_jax,
-                    k=k_jax,
-                    v=v_jax,
-                    attention_metadata=md,
-                    mesh=self.mesh,
-                    sm_scale=_scale,
-                    update_kv_cache=_update_kv,
-                )
 
-            # Mutate the KV cache list in-place — that's how the wrapper
-            # context propagates the updated cache to the next layer.
-            ctx.kv_caches[layer_idx] = new_kv
+        # Mutate the KV cache list in-place — that's how the wrapper
+        # context propagates the updated cache to the next layer.
+        ctx.kv_caches[layer_idx] = new_kv
 
         # output: [num_tokens, n_q, v_head_dim] -> [num_tokens, n_q * v_head_dim]
         out_torch = torch_view(output)
