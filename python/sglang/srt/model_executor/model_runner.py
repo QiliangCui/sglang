@@ -236,21 +236,17 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-import sys as _sys
-import os as _os
-_sys.stderr.write(
-    f"[model_runner module-import] pid={_os.getpid()} ppid={_os.getppid()} "
-    f"current_platform={type(current_platform).__name__} "
-    f"is_tpu={current_platform.is_tpu()} "
-    f"is_oot={current_platform.is_out_of_tree()} _is_npu={_is_npu}\n"
-)
-_sys.stderr.flush()
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
-elif current_platform.is_out_of_tree() or current_platform.is_tpu():
+elif current_platform.is_out_of_tree():
+    # OOT platforms: keep module-import init (original behavior).
     current_platform.init_backend()
+# In-tree TPU: defer init_backend to ModelRunner.__init__ so it only fires
+# in the worker process. Importing model_runner in the parent (e.g. for
+# `from .model_runner import ModelRunner`) must not init libtpu — the
+# parent must not claim TPU devices the worker needs.
 
 MLA_ATTENTION_BACKENDS = [
     "aiter",
@@ -522,6 +518,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
             self.init_threads_binding()
+
+        # TPU: init_backend was deferred from model_runner module-import to
+        # here so it only fires in the worker process (not the parent that
+        # spawned us). This is required so the parent doesn't claim
+        # /dev/vfio/* TPU devices the worker needs.
+        if current_platform.is_tpu():
+            current_platform.init_backend()
 
         # Get available memory before model loading
         pre_model_load_memory = self.init_torch_distributed()
@@ -1325,7 +1328,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             except FileNotFoundError:
                 pass
             import torchax
-            _load_ctx = torchax.default_env()
+            # `torch.no_grad()` is required so weight_loader's
+            # `param.data.copy_(...)` doesn't trip "leaf Variable that
+            # requires grad" under torchax.
+            class _TPULoadCtx:
+                def __enter__(self):
+                    self._env = torchax.default_env().__enter__()
+                    self._grad = torch.no_grad().__enter__()
+                    return self
+                def __exit__(self, *exc):
+                    torch.no_grad().__exit__(*exc)
+                    self._env.__exit__(*exc)
+            _load_ctx = _TPULoadCtx()
         else:
             _load_ctx = contextlib.nullcontext()
         with self.memory_saver_adapter.region(

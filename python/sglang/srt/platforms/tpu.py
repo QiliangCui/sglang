@@ -44,13 +44,29 @@ def is_tpu_available() -> bool:
     return os.path.exists("/dev/vfio/0")
 
 
+def _libtpu_initialized() -> bool:
+    """Has libtpu been initialized in THIS process?
+
+    We must not import/call jax.devices() in the parent process — that
+    claims TPU vfio devices the worker needs. `init_backend()` sets the
+    sentinel on the platform instance when it runs (worker only).
+    """
+    return getattr(_TpuFlag, "ready", False)
+
+
+class _TpuFlag:
+    ready: bool = False
+
+
 class TpuDeviceMixin(DeviceMixin):
     """TPU implementation of the shared device operations.
 
     All [Planned] methods that sglang core doesn't yet call through
     `current_platform.*` are left raising NotImplementedError so we
     notice the day core gets migrated. The [Active] ones — memory
-    queries — return jax-sourced answers.
+    queries — return jax-sourced answers ONLY after init_backend has
+    run in this process. Before init_backend, return conservative
+    defaults — this keeps the parent process from initializing libtpu.
     """
 
     _enum: PlatformEnum = PlatformEnum.TPU
@@ -59,18 +75,21 @@ class TpuDeviceMixin(DeviceMixin):
 
     # --- [Active] memory ----------------------------------------------
     def get_device_total_memory(self, device_id: int = 0) -> int:
+        if not _libtpu_initialized():
+            return 32 * 1024**3  # v6e default; won't init libtpu in parent.
         import jax
 
         try:
             mem = jax.devices()[device_id].memory_stats()
             return int(mem.get("bytes_limit") or mem.get("bytes_in_use") or 0)
         except Exception:
-            # v6e is ~32 GiB; conservative fallback so callers don't choke.
             return 32 * 1024**3
 
     def get_current_memory_usage(
         self, device: Optional["torch.device"] = None
     ) -> float:
+        if not _libtpu_initialized():
+            return 0.0
         import jax
 
         try:
@@ -89,6 +108,8 @@ class TpuDeviceMixin(DeviceMixin):
         return None
 
     def get_device_name(self, device_id: int = 0) -> str:
+        if not _libtpu_initialized():
+            return "tpu"
         import jax
 
         try:
@@ -97,6 +118,8 @@ class TpuDeviceMixin(DeviceMixin):
             return "tpu"
 
     def get_device_uuid(self, device_id: int = 0) -> str:
+        if not _libtpu_initialized():
+            return f"tpu-{device_id}"
         import jax
 
         try:
@@ -110,6 +133,8 @@ class TpuDeviceMixin(DeviceMixin):
         return DeviceCapability(0, 0)
 
     def empty_cache(self) -> None:
+        if not _libtpu_initialized():
+            return
         # XLA manages buffers; no public "empty cache" API.
         # Defragment per-backend on a best-effort basis.
         import jax
@@ -124,12 +149,17 @@ class TpuDeviceMixin(DeviceMixin):
             pass
 
     def synchronize(self) -> None:
+        if not _libtpu_initialized():
+            return
         import jax
 
         # block_until_ready on a 0-d array forces XLA to drain.
         jax.block_until_ready(jax.numpy.zeros(()))
 
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
+        if not _libtpu_initialized():
+            total = self.get_device_total_memory(device_id)
+            return (total, total)
         import jax
 
         try:
@@ -193,6 +223,9 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
         return self._init_backend_inner()
 
     def _init_backend_inner(self) -> None:
+        # Mark THIS process as libtpu-initialized so the device-query
+        # methods (get_device_total_memory etc) start using jax.devices().
+        _TpuFlag.ready = True
         """Actual body. Wrapped so we can verify firing from logs.
 
         Order matters:

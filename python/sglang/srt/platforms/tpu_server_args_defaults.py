@@ -175,3 +175,10 @@ def apply(server_args) -> None:
     # env var in the parent makes spawned workers force TPU.
     import os as _os
     _os.environ["SGLANG_FORCE_TPU"] = "1"
+    # Mark the parent PID so the worker can tell if it's a spawned child
+    # (different PID) and clear JAX_PLATFORMS=cpu before importing jax.
+    _os.environ["SGLANG_TPU_PARENT_PID"] = str(_os.getpid())
+    # Force parent to skip TPU init by routing jax to CPU. The worker
+    # subprocess clears this env-var early (see sglang/__init__.py
+    # bootstrap) so its jax inits TPU normally.
+    _os.environ.setdefault("JAX_PLATFORMS", "cpu")

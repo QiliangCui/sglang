@@ -1,5 +1,16 @@
 # SGLang public APIs
 
+# TPU worker bootstrap: if the parent set JAX_PLATFORMS=cpu (so it could
+# avoid initializing libtpu) and we're a spawned child process (different
+# PID), clear JAX_PLATFORMS so our jax inits TPU normally.
+# This MUST run before any `import jax` anywhere in the chain.
+import os as _os
+if (_os.environ.get("SGLANG_TPU_PARENT_PID")
+        and _os.environ.get("SGLANG_TPU_PARENT_PID") != str(_os.getpid())):
+    if _os.environ.get("JAX_PLATFORMS") == "cpu":
+        del _os.environ["JAX_PLATFORMS"]
+del _os
+
 # Install stubs early for platforms where certain dependencies are unavailable
 # (e.g. macOS/MPS has no triton, and torch.mps lacks Stream / set_device /
 # get_device_properties).  This must run before any downstream imports.
