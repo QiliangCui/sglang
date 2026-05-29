@@ -175,6 +175,18 @@ def is_npu() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_tpu() -> bool:
+    """Detect a TPU host via jax.devices() (torchax-only; we do not poll
+    torch.tpu since torchax claims PrivateUse1 as "jax" not "tpu")."""
+    try:
+        import jax
+
+        return any(d.platform == "tpu" for d in jax.devices())
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (

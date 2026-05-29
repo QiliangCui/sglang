@@ -1603,6 +1603,7 @@ _DEVICE_TO_DISTRIBUTED_BACKEND = {
     "cpu": "gloo",
     "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
     "musa": "mccl",
+    "tpu": "gloo",  # single-host MVP; SPMD inside jax.jit handles collectives
 }
 
 
