@@ -759,7 +759,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
         # Init memory pool and attention backends
-        self.init_memory_pool(pre_model_load_memory)
+        # On TPU, memory_pool.__init__ calls torch.empty(device='jax')
+        # which needs torchax.default_env() active for dispatch.
+        if current_platform.is_tpu():
+            import torchax as _tpx
+            with _tpx.default_env():
+                self.init_memory_pool(pre_model_load_memory)
+        else:
+            self.init_memory_pool(pre_model_load_memory)
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
