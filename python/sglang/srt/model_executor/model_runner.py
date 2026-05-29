@@ -1446,12 +1446,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dumper.register_non_intrusive_dumper(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
-        reserve_rope_cache_for_long_sequences(
-            self.model,
-            self.server_args,
-            self.model_config,
-            logger,
-        )
+        # Skip on TPU: the call does `.to(device='jax')` outside
+        # default_env() and trips aten::empty_strided.
+        # JaxStepRunner's JIT handles RoPE eagerly per step anyway.
+        if not current_platform.is_tpu():
+            reserve_rope_cache_for_long_sequences(
+                self.model,
+                self.server_args,
+                self.model_config,
+                logger,
+            )
 
         if self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
