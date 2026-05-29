@@ -157,15 +157,13 @@ def test_torchax_not_imported_at_parent_level():
     assert r.returncode == 0, (r.stdout, r.stderr)
 
 
-def test_attention_backend_registration_is_lazy():
-    """Until S3 lands JaxAttentionBackend's real body, init_backend swallows
-    the ImportError. Once the real class is importable, registration goes
-    live with no further edit."""
+def test_jax_attention_backend_registered():
+    """S3.2 landed JaxAttentionBackend's real body — init_backend now
+    successfully registers it under 'jax'."""
     from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+    from sglang.srt.layers.attention.jax_backend import JaxAttentionBackend
     from sglang.srt.platforms import current_platform
 
     current_platform.init_backend()
-    # We don't assert "jax" is here yet — JaxAttentionBackend.__init__
-    # raises in S2 because base methods are abstract. Once S3.2 lands a
-    # concrete class, this test will start asserting presence.
-    assert isinstance(ATTENTION_BACKENDS, dict)
+    assert "jax" in ATTENTION_BACKENDS, list(ATTENTION_BACKENDS.keys())
+    assert ATTENTION_BACKENDS["jax"] is JaxAttentionBackend
