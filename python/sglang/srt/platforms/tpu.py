@@ -222,12 +222,37 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
 
         torch.compile = _no_compile
 
-        # 3. Device-module alias for "tpu". torchax claims PrivateUse1 as
-        #    "jax"; we layer a "tpu" name on top so sglang core's
-        #    `torch.get_device_module(self.device)` resolves cleanly.
+        # 3. Device-module alias for "tpu". torch 2.11 won't let us call
+        #    `torch._register_device_module("tpu", ...)` — its torch.device()
+        #    constructor allow-list doesn't include "tpu", and torchax has
+        #    already claimed privateuseone as "jax". So we monkey-patch
+        #    `torch.get_device_module` to intercept the "tpu" call and
+        #    return our shim; everything else falls through to upstream.
+        #    (KB §12.5 option C — chosen 2026-05-29 after option A failed
+        #    on torch 2.11; see progress.md.)
         from sglang.srt.platforms.tpu_device_module import TpuDeviceModule
 
-        torch._register_device_module("tpu", TpuDeviceModule())
+        _tpu_module = TpuDeviceModule()
+        _orig_get_device_module = torch.get_device_module
+
+        def _get_device_module_with_tpu(device=None):
+            if device == "tpu" or (
+                isinstance(device, torch.device) and device.type == "tpu"
+            ):
+                return _tpu_module
+            if device is None:
+                # No-arg form: sglang core uses this in module-level type
+                # annotations (e.g. parallel_state.py GraphCaptureContext).
+                # torch's default lookup hits torch._C._get_accelerator()
+                # which raises on the partial PrivateUse1 registration
+                # torchax leaves us with — return our shim instead.
+                return _tpu_module
+            return _orig_get_device_module(device)
+
+        # Idempotent: don't double-wrap on second init_backend call.
+        if not getattr(torch.get_device_module, "_tpu_aware", False):
+            _get_device_module_with_tpu._tpu_aware = True
+            torch.get_device_module = _get_device_module_with_tpu
 
         # 4. Register the JAX attention backend if sglang's attention
         #    registry is reachable. Done lazily — the backend module is
