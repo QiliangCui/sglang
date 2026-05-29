@@ -417,6 +417,46 @@ class ModelRunnerKVCacheMixin:
                 end_layer=self.end_layer,
                 enable_hisparse=self.enable_hisparse,
             )
+        elif current_platform.is_tpu() and not self.mambaish_config:
+            # In-tree TPU MVP — instantiate the JAX KV pool directly so we
+            # don't go through current_platform.get_*_cls() (the 15-factory
+            # OOT contract; we deliberately skip it per decisions/
+            # 2026-05-29_in-tree-mvp.md). MLA / DSA paths are forbidden by
+            # apply_server_args_defaults; if we somehow reach them the
+            # stub raises NotImplementedError, which is what we want.
+            from sglang.srt.mem_cache.jax_kv_pool import (
+                JaxMHATokenToKVPool,
+                JaxMLATokenToKVPool,
+            )
+
+            if self.use_mla_backend:
+                self.token_to_kv_pool = JaxMLATokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
+            else:
+                self.token_to_kv_pool = JaxMHATokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
                 PoolCls = current_platform.get_dsa_kv_pool_cls()

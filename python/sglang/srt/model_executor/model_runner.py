@@ -2990,6 +2990,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # In-tree TPU short-circuit (plan §S1.5 row 9, kb §12.4): route
+        # decode through the JaxStepRunner's single jax.jit'd step. Built
+        # lazily so model_runner doesn't import JaxStepRunner unless we
+        # really are on TPU.
+        if self.device == "tpu":
+            if getattr(self, "_jax_step_runner", None) is None:
+                from sglang.srt.model_executor.jax_step_runner import (
+                    JaxStepRunner,
+                )
+
+                self._jax_step_runner = JaxStepRunner(self)
+            return self._jax_step_runner.step(forward_batch)
+
         # Set extra arguments
         pdmux_override = False
         if not skip_attn_backend_init:
@@ -3041,6 +3054,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Tuple[
         Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
     ]:
+        # In-tree TPU short-circuit (plan §S1.5 row 9, kb §12.4, risk #31):
+        # extend MUST go through a JIT vehicle or torchax retraces every
+        # batch -> OOM. Same JaxStepRunner as decode; the runner routes
+        # via the RPA-v3 distribution triple inside the JIT body. Return
+        # (output, False) — second element is `can_run_graph`, which is
+        # irrelevant here (graph capture path is disabled on TPU).
+        if self.device == "tpu":
+            if getattr(self, "_jax_step_runner", None) is None:
+                from sglang.srt.model_executor.jax_step_runner import (
+                    JaxStepRunner,
+                )
+
+                self._jax_step_runner = JaxStepRunner(self)
+            return (self._jax_step_runner.step(forward_batch), False)
+
         # Setup extra arguments
         kwargs = {}
         if self.support_pp:
