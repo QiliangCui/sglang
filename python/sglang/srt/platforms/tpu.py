@@ -248,9 +248,9 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
         _orig_get_device_module = torch.get_device_module
 
         def _get_device_module_with_tpu(device=None):
-            if device == "tpu" or (
-                isinstance(device, torch.device) and device.type == "tpu"
-            ):
+            if device in ("tpu", "jax"):
+                return _tpu_module
+            if isinstance(device, torch.device) and device.type in ("tpu", "jax", "privateuseone"):
                 return _tpu_module
             if device is None:
                 # No-arg form: sglang core uses this in module-level type
