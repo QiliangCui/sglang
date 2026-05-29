@@ -20,6 +20,7 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
+from sglang.srt.platforms.tpu import TpuSRTPlatform, is_tpu_available
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,12 @@ def _resolve_platform() -> SRTPlatform:
                 "No platform plugin detected. Using ROCm SRTPlatform defaults."
             )
             return RocmSRTPlatform()
+        if is_tpu_available():
+            logger.debug(
+                "No platform plugin detected. Using TPU SRTPlatform "
+                "(jax.devices() reports a TpuDevice)."
+            )
+            return TpuSRTPlatform()
         logger.debug("No platform detected. Using base SRTPlatform.")
         return SRTPlatform()
 
