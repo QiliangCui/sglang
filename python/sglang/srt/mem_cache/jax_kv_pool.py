@@ -20,11 +20,21 @@ import torch
 
 
 class JaxMHATokenToKVPool:
-    """Minimal MHA KV pool for MVP demo.
+    """MHA KV pool for the MVP demo.
 
-    Stores config so the mixin / scheduler can read `size`, `page_size`,
-    `dtype`, etc. Does NOT allocate any device buffers — those live in
-    JaxStepRunner.
+    Owns config the Scheduler reads (`size`, `page_size`, `dtype`, etc.)
+    plus a reference to the per-layer JAX KV cache arrays allocated by
+    JaxStepRunner. The kv_caches themselves live in JAX device memory;
+    JaxStepRunner mutates them per-step via the JIT donate/return pattern
+    and updates the `jax_kv_caches` attribute below so anything reading
+    via `model_runner.token_to_kv_pool` sees the freshest reference.
+
+    S3.3 follow-up: convert the sglang flat `[max_total_tokens, n_heads,
+    head_dim]` ABI on `get_key_buffer`/`set_kv_buffer` to/from the RPA-v3
+    5-D paged layout. Today both pass-through to no-ops because the
+    Scheduler at `--max-running-requests 1 --disable-radix-cache` never
+    actually reads the buffers — the kernel writes/reads them in-place
+    inside the JIT.
     """
 
     def __init__(
@@ -54,6 +64,15 @@ class JaxMHATokenToKVPool:
         # want a stable object.
         self._k_buffer = [torch.empty(0) for _ in range(layer_num)]
         self._v_buffer = [torch.empty(0) for _ in range(layer_num)]
+        # KV cache layout used by the RPA-v3 kernel. JaxStepRunner sets
+        # these after _allocate_kv_caches and refreshes jax_kv_caches
+        # after each step via the JIT donate/return pattern.
+        # `jax_kv_caches`: list[jax.Array], shape
+        #   (kv_num_pages, kv_page_size, n_kv, 2, head_dim) per layer.
+        self.jax_kv_caches = None
+        self.kv_num_pages = 0
+        self.kv_page_size = page_size
+        self.kv_pages_per_seq = 0
 
     # ---- common mixin API ------------------------------------------------
     def get_kv_size_bytes(self) -> int:

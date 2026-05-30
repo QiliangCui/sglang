@@ -95,6 +95,11 @@ class JaxAttentionBackend(AttentionBackend):
         # supplies kv_cache through JaxForwardContext.
         self.req_to_token_pool = None
         self.token_to_kv_pool = None
+        # JaxStepRunner sets _kv_pages_per_seq right after allocating the
+        # kv_caches so _build_metadata can build a correctly-sized
+        # block_tables. Default for the spike code path.
+        self._kv_pages_per_seq = 4
+        self._kv_page_size = 16
 
         # Build mesh once per process.
         if type(self)._mesh is None:
@@ -202,10 +207,18 @@ class JaxAttentionBackend(AttentionBackend):
                 [batch_size, batch_size, batch_size], dtype=jnp.int32
             )
 
-        # block_tables: S3.2 placeholder. Single page per seq.
-        pages_per_seq = 4  # arbitrary; S3.3 derives from page_size etc.
-        block_tables = jnp.zeros(
-            (batch_size * pages_per_seq,), dtype=jnp.int32
+        # block_tables: S3.3 MVP — each request owns physical pages
+        # [0, 1, 2, ..., pages_per_seq-1]. Position p of request r maps to
+        # physical slot p (page p//page_size, offset p%page_size) — exactly
+        # what the kernel expects when it does
+        #   slot = block_tables[r][p // page_size] * page_size + (p % page_size).
+        # At --max-running-requests 1 every prefill overwrites slots 0..N
+        # before reading them, so the prior request's residue is harmless.
+        # S3.3 followups: real `JaxMHATokenToKVPool` ABI + per-request
+        # page allocation for max_running_requests>1.
+        pages_per_seq = self._kv_pages_per_seq
+        block_tables = jnp.tile(
+            jnp.arange(pages_per_seq, dtype=jnp.int32), batch_size
         )
 
         # PROBE 3: dump the metadata the attention kernel will see.

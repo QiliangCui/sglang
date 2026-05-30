@@ -126,6 +126,10 @@ class JaxStepRunner:
         )
 
         # Conservative defaults; production needs --page-size tuning.
+        # S3.3 (this round): each single-request session "owns" pages
+        # [0, 1, 2, ...] — block_tables in jax_backend is now arange-per-
+        # request, so position p maps to physical slot p (page p//page_size,
+        # offset p%page_size). Wrap-around no longer corrupts the prefix.
         num_pages = 256
         page_size = 16
 
@@ -134,9 +138,25 @@ class JaxStepRunner:
         self._kv_caches = [
             jnp.zeros(shape, dtype=jnp.bfloat16) for _ in range(n_layers)
         ]
+        # Hand pages_per_seq + page_size to the attention backend so its
+        # _build_metadata builds a block_tables shaped/valued correctly.
+        # At --max-running-requests 1 every request owns the entire pool.
+        self._attn_backend._kv_pages_per_seq = num_pages
+        self._attn_backend._kv_page_size = page_size
+        # Also publish on the model_runner's KV pool so anything reading
+        # via `model_runner.token_to_kv_pool` sees the layout. The pool's
+        # ABI surface (`get_key_buffer`, `set_kv_buffer`, etc.) still
+        # passes through to no-ops at single-request MVP.
+        _pool = getattr(self.model_runner, "token_to_kv_pool", None)
+        if _pool is not None and hasattr(_pool, "jax_kv_caches"):
+            _pool.jax_kv_caches = self._kv_caches
+            _pool.kv_num_pages = num_pages
+            _pool.kv_page_size = page_size
+            _pool.kv_pages_per_seq = num_pages
         logger.info(
-            "JaxStepRunner kv_caches: %d layers, per-layer shape %s",
-            n_layers, shape,
+            "JaxStepRunner kv_caches: %d layers, per-layer shape %s, "
+            "pages_per_seq=%d page_size=%d",
+            n_layers, shape, num_pages, page_size,
         )
 
     # ------------------------------------------------------------------
@@ -246,6 +266,11 @@ class JaxStepRunner:
                 setattr(forward_batch, _k, _v)
         # Donation freed the prior list; rebind so next call sees the new state.
         self._kv_caches = list(new_kv)
+        # Refresh the pool's mirror so downstream readers via
+        # model_runner.token_to_kv_pool see the freshest references.
+        _pool = getattr(self.model_runner, "token_to_kv_pool", None)
+        if _pool is not None and hasattr(_pool, "jax_kv_caches"):
+            _pool.jax_kv_caches = self._kv_caches
         # Downstream sample() runs torch ops outside torchax.default_env, so
         # materialize logits as a plain CPU torch.Tensor.
         logits_np = _np.asarray(logits_jax)
