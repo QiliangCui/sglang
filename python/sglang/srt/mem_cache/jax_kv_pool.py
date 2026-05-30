@@ -75,6 +75,18 @@ class JaxMHATokenToKVPool:
         self.kv_pages_per_seq = 0
 
     # ---- common mixin API ------------------------------------------------
+    @property
+    def mem_usage(self) -> float:
+        # GB used by jax_kv_caches across all layers. Probes (Scheduler
+        # `get_internal_state`) call this on the bench / monitoring path.
+        if self.jax_kv_caches is None:
+            return 0.0
+        try:
+            per_layer_bytes = self.jax_kv_caches[0].nbytes
+            return (per_layer_bytes * len(self.jax_kv_caches)) / (1024 ** 3)
+        except Exception:
+            return 0.0
+
     def get_kv_size_bytes(self) -> int:
         return 0
 
