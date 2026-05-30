@@ -275,6 +275,22 @@ class JaxStepRunner:
         # materialize logits as a plain CPU torch.Tensor.
         logits_np = _np.asarray(logits_jax)
         logits_cpu = torch.from_numpy(logits_np)
+        # V2 LOGIT-DIFF probe: dump top-10 every step. Gate behind env var
+        # so production / regression runs stay quiet.
+        import os as _v2_os
+        if _v2_os.environ.get("SGLANG_DUMP_TOP10"):
+            try:
+                _row = logits_np.reshape(-1, logits_np.shape[-1])[-1]
+                _top = (-_row).argsort()[:10]
+                _pairs = [(int(i), float(_row[i])) for i in _top]
+                logger.warning(
+                    "DUMP_TOP10 mode=%s positions=%s bs=%s top10=%s",
+                    mode_key,
+                    forward_batch.positions.tolist() if hasattr(forward_batch.positions, "tolist") else None,
+                    batch_size, _pairs,
+                )
+            except Exception as _e_t10:
+                logger.warning("DUMP_TOP10 failed: %s", _e_t10)
         # PROBE 0 / 2: per-step dump of input metadata + chosen token.
         import os as _probe_os
         if _probe_os.environ.get("SGLANG_PROBE0") or _probe_os.environ.get("SGLANG_PROBE2"):
