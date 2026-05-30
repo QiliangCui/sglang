@@ -540,6 +540,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
         device = model_runner.device
+        # On TPU ('jax') torch can't construct tensors with device='jax'
+        # outside torchax.default_env. ForwardBatch is bookkeeping only —
+        # JaxStepRunner re-materialises what it needs. Keep these on CPU.
+        if isinstance(device, str) and device == "jax":
+            device = "cpu"
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (

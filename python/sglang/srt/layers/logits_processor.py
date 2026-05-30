@@ -1003,6 +1003,9 @@ class LogitsProcessor(nn.Module):
             logits_buffer.copy_(logits[:, : self.vocab_size])
             logits = logits_buffer
         else:
+            if logits.ndim == 1:
+                # Single-token case where some upstream collapsed [1, V] -> [V].
+                logits = logits.unsqueeze(0)
             logits = logits[:, : self.vocab_size].float()
         return logits
 

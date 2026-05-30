@@ -77,19 +77,23 @@ class SamplingBatchInfo:
 
         reqs = batch.reqs
         device = batch.device
+        # On TPU ('jax') torch.tensor(device='jax') is not supported — torchax
+        # doesn't hook PyTorch's tensor constructor that way. Allocate sampling
+        # tensors on CPU; JaxStepRunner moves them as needed.
+        _alloc_dev = "cpu" if (isinstance(device, str) and device == "jax") else device
         temperatures = torch.tensor(
             [r.sampling_params.temperature for r in reqs],
             dtype=torch.float,
-            device=device,
+            device=_alloc_dev,
         ).view(-1, 1)
         top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
+            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=_alloc_dev
         )
         top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
+            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=_alloc_dev
         )
         min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
+            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=_alloc_dev
         )
         sampling_seed = (
             torch.tensor(
@@ -102,7 +106,7 @@ class SamplingBatchInfo:
                     for r in reqs
                 ],
                 dtype=torch.int64,
-                device=device,
+                device=_alloc_dev,
             )
             if enable_deterministic
             else None
@@ -110,7 +114,7 @@ class SamplingBatchInfo:
 
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
-            logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
+            logit_bias = torch.zeros(len(reqs), vocab_size, device=_alloc_dev)
             for i, r in enumerate(reqs):
                 if r.sampling_params.logit_bias is not None:
                     for key, value in r.sampling_params.logit_bias.items():

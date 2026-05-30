@@ -114,6 +114,10 @@ def flatten_arrays_to_int64_tensor(
     cpu_t = torch.from_numpy(combined)
     if pin:
         cpu_t = cpu_t.pin_memory()
+    # TPU: torch.empty(...).to(device='jax') fails outside torchax.default_env.
+    # Keep on CPU; JaxStepRunner moves to JAX with jax_view at step entry.
+    if isinstance(device, str) and device == "jax":
+        return cpu_t
     return cpu_t.to(device, non_blocking=True)
 
 
@@ -406,7 +410,8 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    # 'jax' = our TPU backend; no Triton.
+    return backend not in ["torch_native", "intel_amx", "jax"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(

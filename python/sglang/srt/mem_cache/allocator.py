@@ -134,12 +134,15 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        # TPU: keep allocator bookkeeping tensors on CPU. The actual KV cache
+        # lives in JaxStepRunner; this just tracks free token-slot indices.
+        _dev = "cpu" if (isinstance(self.device, str) and self.device == "jax") else self.device
         self.free_pages = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device=self.device
+            1, self.size + 1, dtype=torch.int64, device=_dev
         )
         self.is_not_in_free_group = True
         self.free_group = []
-        self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self.release_pages = torch.empty((0,), dtype=torch.int64, device=_dev)
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead

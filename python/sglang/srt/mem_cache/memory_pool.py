@@ -156,9 +156,13 @@ class ReqToTokenPool:
         self._alloc_size = size + 1
         self.max_context_len = max_context_len
         self.device = device
+        # On 'jax' (TPU) the real KV cache lives in JaxStepRunner; this pool
+        # is bookkeeping only. Keep req_to_token on CPU so writes from CPU
+        # tensors don't mix XLA/torch dispatch.
+        _alloc_dev = "cpu" if (isinstance(device, str) and device == "jax") else device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
-                (self._alloc_size, max_context_len), dtype=torch.int32, device=device
+                (self._alloc_size, max_context_len), dtype=torch.int32, device=_alloc_dev
             )
         self.free_slots = list(range(1, self._alloc_size))
 

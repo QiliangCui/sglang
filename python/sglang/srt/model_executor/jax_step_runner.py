@@ -175,8 +175,16 @@ class JaxStepRunner:
         # Pad input_ids and positions to bucket_num_tokens, holding the
         # underlying forward_batch otherwise intact (extend_seq_lens etc.
         # still reflect real token counts → kernel writes only real K/V).
-        ji_jax = jax_view(forward_batch.input_ids).astype(jnp.int32)
-        pj_jax = jax_view(forward_batch.positions).astype(jnp.int32)
+        # input_ids/positions arrive as plain CPU torch.Tensors (the schedule
+        # path keeps them off-device on TPU). Lift to JAX via numpy bridge.
+        import numpy as _np
+        from torchax.tensor import Tensor as _TxTensor
+        def _to_jax_i32(t):
+            if isinstance(t, _TxTensor):
+                return jax_view(t).astype(jnp.int32)
+            return jnp.asarray(_np.asarray(t), dtype=jnp.int32)
+        ji_jax = _to_jax_i32(forward_batch.input_ids)
+        pj_jax = _to_jax_i32(forward_batch.positions)
         pad = bucket_num_tokens - real_num_tokens
         if pad > 0:
             ji_jax = jnp.pad(ji_jax, (0, pad))
@@ -193,7 +201,15 @@ class JaxStepRunner:
         )
         # Donation freed the prior list; rebind so next call sees the new state.
         self._kv_caches = list(new_kv)
-        return torch_view(logits_jax)
+        # Downstream sample() runs torch ops outside torchax.default_env, so
+        # materialize logits as a plain CPU torch.Tensor.
+        logits_np = _np.asarray(logits_jax)
+        logits_cpu = torch.from_numpy(logits_np)
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        return LogitsProcessorOutput(
+            next_token_logits=logits_cpu,
+            hidden_states=None,
+        )
 
     # ------------------------------------------------------------------
     # JIT compilation
@@ -201,6 +217,7 @@ class JaxStepRunner:
 
     def _build_step_jit(self, forward_batch: "ForwardBatch", cache_key):
         import jax
+        import torchax
 
         # Closure captures: model + forward_batch + ctx. The ctx is rebuilt
         # inside the body so it lives in the traced graph.
@@ -218,7 +235,7 @@ class JaxStepRunner:
 
         def step_fun(params_jax, kv_caches, input_ids_jax, positions_jax):
             ctx = JaxForwardContext(kv_caches=list(kv_caches), mesh=attn_mesh)
-            with set_jax_forward_context(ctx), forward_context(fwd_ctx):
+            with torchax.default_env(), set_jax_forward_context(ctx), forward_context(fwd_ctx):
                 params_torch = {
                     k: torch_view(v) for k, v in params_jax.items()
                 }
