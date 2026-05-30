@@ -1356,6 +1356,95 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     torch.no_grad().__exit__(*exc)
                     self._env.__exit__(*exc)
             _load_ctx = _TPULoadCtx()
+            # Patch every weight_loader call site (default_weight_loader,
+            # VocabParallelEmbedding.weight_loader, linear weight loaders)
+            # to bypass param.data.copy_ — under torchax 0.0.11 + torch
+            # 2.11 the dispatch silently leaves the underlying jax array
+            # at zero. Direct _elem assignment via a helper avoids the
+            # broken dispatch.
+            import jax.numpy as _jnp_load
+            import numpy as _np_load
+            def _direct_assign(param, loaded_weight, shard_dim=None,
+                               shard_start=None, shard_size=None):
+                """Write loaded_weight (CPU torch) into param's jax _elem."""
+                _t = loaded_weight.detach()
+                # numpy doesn't support bfloat16; promote to float32 for the
+                # host bridge, jax converts back to bf16 via dtype.
+                if _t.dtype == torch.bfloat16:
+                    _t = _t.float()
+                _src = _np_load.asarray(_t)
+                if shard_dim is not None and shard_size is not None:
+                    _slc = [slice(None)] * _src.ndim
+                    _slc[shard_dim] = slice(shard_start, shard_start + shard_size)
+                    _src = _src[tuple(_slc)]
+                param._elem = _jnp_load.asarray(_src, dtype=param._elem.dtype)
+
+            # 1) default_weight_loader
+            import sglang.srt.model_loader.weight_utils as _wu
+            _orig_default = _wu.default_weight_loader
+            def _patched_default(param, loaded_weight):
+                if hasattr(param, "_elem"):
+                    _direct_assign(param, loaded_weight)
+                    return
+                _orig_default(param, loaded_weight)
+            _wu.default_weight_loader = _patched_default
+
+            # 2) VocabParallelEmbedding.weight_loader
+            from sglang.srt.layers import vocab_parallel_embedding as _vpe
+            _orig_vpe_loader = _vpe.VocabParallelEmbedding.weight_loader
+            def _patched_vpe_loader(self, param, loaded_weight):
+                if hasattr(param, "_elem"):
+                    output_dim = getattr(param, "output_dim", None)
+                    if output_dim is None:
+                        _direct_assign(param, loaded_weight)
+                        return
+                    start = self.shard_indices.org_vocab_start_index
+                    size = self.shard_indices.org_vocab_end_index - start
+                    _direct_assign(param, loaded_weight,
+                        shard_dim=output_dim, shard_start=start, shard_size=size)
+                    return
+                _orig_vpe_loader(self, param, loaded_weight)
+            _vpe.VocabParallelEmbedding.weight_loader = _patched_vpe_loader
+
+            # 3) Catch-all: patch torch.Tensor.copy_ to assign _elem directly
+            #    when dst is a torchax tensor or a torchax View.
+            from torchax.view import View as _TxView
+            _orig_copy_ = torch.Tensor.copy_
+            def _patched_copy_(self, other, non_blocking=False):
+                if isinstance(self, _TxView):
+                    if hasattr(other, "_elem"):
+                        self.update(other._elem)
+                    else:
+                        _t = other.detach()
+                        if _t.dtype == torch.bfloat16:
+                            _t = _t.float()
+                        self.update(_jnp_load.asarray(
+                            _np_load.asarray(_t), dtype=self.jax().dtype
+                        ))
+                    return self
+                if hasattr(self, "_elem"):
+                    if hasattr(other, "_elem"):
+                        self._elem = other._elem.astype(self._elem.dtype)
+                    else:
+                        _direct_assign(self, other)
+                    return self
+                return _orig_copy_(self, other, non_blocking=non_blocking)
+            torch.Tensor.copy_ = _patched_copy_
+
+            # 4) Patch torch.Tensor.narrow to return a View instead of a
+            #    detached slice for torchax tensors, so the subsequent
+            #    .copy_ propagates writes back to the parent param.
+            from torchax.view import NarrowInfo as _NarrowInfo
+            _orig_narrow = torch.Tensor.narrow
+            def _patched_narrow(self, dim, start, length):
+                if hasattr(self, "_elem") or isinstance(self, _TxView):
+                    # Build a tuple of slices for the View
+                    slices = [slice(None)] * self.ndim
+                    slices[dim] = slice(start, start + length)
+                    return _TxView(self, view_info=_NarrowInfo(tuple(slices)),
+                                   env=self._env)
+                return _orig_narrow(self, dim, start, length)
+            torch.Tensor.narrow = _patched_narrow
         else:
             _load_ctx = contextlib.nullcontext()
         with self.memory_saver_adapter.region(

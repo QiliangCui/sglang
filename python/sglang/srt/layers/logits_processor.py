@@ -450,11 +450,23 @@ class LogitsProcessor(nn.Module):
                     + logits_metadata.extend_seq_lens
                     - 1
                 )
-            pruned_states = hidden_states[last_index]
+            # NOTE: torchax indexing of a 2-D tensor with a 1-D 1-elem CPU torch
+            # tensor collapses the leading dim (returns [H] not [1, H]). Use
+            # explicit slicing through the int index. For multi-request batches
+            # we'd need a real gather; MVP runs max_running_requests=1.
+            if hasattr(hidden_states, "_elem") and last_index.numel() == 1:
+                _i = int(last_index.item())
+                pruned_states = hidden_states[_i : _i + 1]
+            else:
+                pruned_states = hidden_states.index_select(0, last_index)
             if hidden_states_before_norm is not None:
-                pruned_states_before_norm = hidden_states_before_norm[last_index]
+                pruned_states_before_norm = hidden_states_before_norm.index_select(
+                    0, last_index
+                )
             if aux_hidden_states is not None:
-                aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
+                aux_pruned_states = [
+                    hidden.index_select(0, last_index) for hidden in aux_hidden_states
+                ]
             sample_indices = None
             input_logprob_indices = None
         else:
@@ -1003,9 +1015,6 @@ class LogitsProcessor(nn.Module):
             logits_buffer.copy_(logits[:, : self.vocab_size])
             logits = logits_buffer
         else:
-            if logits.ndim == 1:
-                # Single-token case where some upstream collapsed [1, V] -> [V].
-                logits = logits.unsqueeze(0)
             logits = logits[:, : self.vocab_size].float()
         return logits
 

@@ -98,9 +98,12 @@ class JaxStepRunner:
         self._fwd_ctx = ForwardContext(attn_backend=self._attn_backend)
 
         # Snapshot params as a name -> jax.Array pytree.
-        # state_dict() walks all params + buffers under torchax env.
-        sd = self.model.state_dict()
-        self._params_jax = {k: jax_view(v) for k, v in sd.items()}
+        # state_dict() walks all params + buffers; under torchax env so
+        # the underlying jax arrays are reachable for jax_view.
+        import torchax
+        with torchax.default_env():
+            sd = self.model.state_dict()
+            self._params_jax = {k: jax_view(v) for k, v in sd.items()}
         logger.info("JaxStepRunner params snapshot: %d entries", len(sd))
 
         # Allocate KV caches sized to model_config.
@@ -239,6 +242,12 @@ class JaxStepRunner:
                 params_torch = {
                     k: torch_view(v) for k, v in params_jax.items()
                 }
+                # Mutate the closure-captured forward_batch so the attention
+                # backend reads the same jax-staged input_ids / positions
+                # the JIT trace was called with (not the CPU torch ones from
+                # the time of compile).
+                fb.input_ids = torch_view(input_ids_jax)
+                fb.positions = torch_view(positions_jax)
                 kwargs = {
                     "input_ids": torch_view(input_ids_jax),
                     "positions": torch_view(positions_jax),
