@@ -455,14 +455,33 @@ class LogitsProcessor(nn.Module):
             # explicit slicing through the int index. For multi-request batches
             # we'd need a real gather; MVP runs max_running_requests=1.
             if hasattr(hidden_states, "_elem") and last_index.numel() == 1:
-                _i = int(last_index.item())
-                pruned_states = hidden_states[_i : _i + 1]
+                # torchax indexing with a 1-D 1-elem tensor collapses to [H]
+                # not [1, H]. Use jnp.take on the underlying jax arrays so
+                # the gather works correctly AND supports dynamic indices
+                # under JIT trace (last_index is traced when extend_seq_lens
+                # comes in as an explicit JIT arg — see jax_step_runner).
+                import jax.numpy as _jnp_slice
+                import numpy as _np_slice
+                import torchax as _txa_slice
+                _hs_jax = hidden_states._elem
+                if hasattr(last_index, "_elem"):
+                    _li_jax = last_index._elem.astype(_jnp_slice.int32)
+                else:
+                    _li_jax = _jnp_slice.asarray(
+                        _np_slice.asarray(last_index.detach()),
+                        dtype=_jnp_slice.int32,
+                    )
+                _pruned_jax = _jnp_slice.take(_hs_jax, _li_jax, axis=0)
+                pruned_states = _txa_slice.tensor.Tensor(
+                    _pruned_jax, hidden_states._env
+                )
                 import os as _probe_os
                 if _probe_os.environ.get("SGLANG_PROBE0"):
                     try:
                         print(
-                            f"[PROBE0] i={_i} hidden_states.shape={tuple(hidden_states.shape)} "
-                            f"extend_seq_lens={logits_metadata.extend_seq_lens.tolist() if hasattr(logits_metadata.extend_seq_lens,'tolist') else logits_metadata.extend_seq_lens} "
+                            f"[PROBE0] hidden_states.shape={tuple(hidden_states.shape)} "
+                            f"last_index.shape={tuple(last_index.shape)} "
+                            f"pruned_states.shape={tuple(pruned_states.shape)} "
                             f"padded_static_len={logits_metadata.padded_static_len}",
                             flush=True,
                         )

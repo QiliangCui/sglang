@@ -153,6 +153,14 @@ class JaxStepRunner:
         from KV cache writes and from attention output that gets
         sampled.
 
+        Per-call dynamic forward_batch fields (extend_seq_lens, seq_lens,
+        positions, etc.) are passed as **explicit JIT arguments** so JAX
+        treats them as runtime inputs instead of trace-time constants.
+        Earlier versions captured them in the step_fun closure, which
+        baked the warmup's metadata into the JIT trace and produced
+        wrong tokens on every subsequent request (see probes 0/2/3
+        report 2026-05-30 19:25 UTC).
+
         Returns the model output (`LogitsProcessorOutput` for generation,
         embedding pooler output otherwise). Mutates internal kv_caches.
         """
@@ -175,33 +183,67 @@ class JaxStepRunner:
             bucket_num_tokens = real_num_tokens
         cache_key = (mode_key, bucket_num_tokens, batch_size)
 
-        # Pad input_ids and positions to bucket_num_tokens, holding the
-        # underlying forward_batch otherwise intact (extend_seq_lens etc.
-        # still reflect real token counts → kernel writes only real K/V).
-        # input_ids/positions arrive as plain CPU torch.Tensors (the schedule
-        # path keeps them off-device on TPU). Lift to JAX via numpy bridge.
+        # Materialize every per-call dynamic field as a JAX array, padding
+        # token-axis fields up to bucket_num_tokens. These become explicit
+        # JIT args — never closure-captured.
         import numpy as _np
         from torchax.tensor import Tensor as _TxTensor
-        def _to_jax_i32(t):
+
+        def _to_jax_i32(t, target_len=None):
             if isinstance(t, _TxTensor):
-                return jax_view(t).astype(jnp.int32)
-            return jnp.asarray(_np.asarray(t), dtype=jnp.int32)
-        ji_jax = _to_jax_i32(forward_batch.input_ids)
-        pj_jax = _to_jax_i32(forward_batch.positions)
-        pad = bucket_num_tokens - real_num_tokens
-        if pad > 0:
-            ji_jax = jnp.pad(ji_jax, (0, pad))
-            pj_jax = jnp.pad(pj_jax, (0, pad))
+                arr = jax_view(t).astype(jnp.int32)
+            else:
+                arr = jnp.asarray(_np.asarray(t), dtype=jnp.int32)
+            if target_len is not None and arr.shape[0] < target_len:
+                arr = jnp.pad(arr, (0, target_len - arr.shape[0]))
+            return arr
+
+        ji_jax = _to_jax_i32(forward_batch.input_ids, bucket_num_tokens)
+        pj_jax = _to_jax_i32(forward_batch.positions, bucket_num_tokens)
+        sl_jax = _to_jax_i32(forward_batch.seq_lens)
+        # out_cache_loc: extend uses sum-of-extend_seq_lens elements,
+        # decode uses batch_size elements. Pad to bucket_num_tokens so the
+        # JIT signature is shape-stable per cache_key.
+        ocl_jax = _to_jax_i32(forward_batch.out_cache_loc, bucket_num_tokens)
+        rpi_jax = _to_jax_i32(forward_batch.req_pool_indices)
+        # extend_seq_lens / extend_prefix_lens: real only in extend mode.
+        # For decode pass zeros of the right shape so the JIT signature
+        # is identical across all decode calls — the closure-captured
+        # `is_extend` flag in step_fun controls whether they get used.
+        if is_extend:
+            esl_jax = _to_jax_i32(forward_batch.extend_seq_lens)
+            epl_jax = _to_jax_i32(forward_batch.extend_prefix_lens)
+        else:
+            esl_jax = jnp.zeros((batch_size,), dtype=jnp.int32)
+            epl_jax = jnp.zeros((batch_size,), dtype=jnp.int32)
 
         if cache_key not in self._step_jits:
             self._step_jits[cache_key] = self._build_step_jit(
-                forward_batch, cache_key
+                forward_batch, cache_key, is_extend
             )
         step_jit = self._step_jits[cache_key]
 
-        logits_jax, new_kv = step_jit(
-            self._params_jax, self._kv_caches, ji_jax, pj_jax
-        )
+        # step_fun mutates fb fields in-place so the model + attention
+        # backend see the JIT-traced runtime arrays. Snapshot the
+        # originals here and restore after so downstream code (sampler,
+        # etc.) runs against the plain CPU torch tensors again.
+        _saved = {
+            "input_ids": forward_batch.input_ids,
+            "positions": forward_batch.positions,
+            "seq_lens": forward_batch.seq_lens,
+            "out_cache_loc": forward_batch.out_cache_loc,
+            "req_pool_indices": forward_batch.req_pool_indices,
+            "extend_seq_lens": getattr(forward_batch, "extend_seq_lens", None),
+            "extend_prefix_lens": getattr(forward_batch, "extend_prefix_lens", None),
+        }
+        try:
+            logits_jax, new_kv = step_jit(
+                self._params_jax, self._kv_caches,
+                ji_jax, pj_jax, sl_jax, esl_jax, epl_jax, ocl_jax, rpi_jax,
+            )
+        finally:
+            for _k, _v in _saved.items():
+                setattr(forward_batch, _k, _v)
         # Donation freed the prior list; rebind so next call sees the new state.
         self._kv_caches = list(new_kv)
         # Downstream sample() runs torch ops outside torchax.default_env, so
@@ -247,12 +289,17 @@ class JaxStepRunner:
     # JIT compilation
     # ------------------------------------------------------------------
 
-    def _build_step_jit(self, forward_batch: "ForwardBatch", cache_key):
+    def _build_step_jit(self, forward_batch: "ForwardBatch", cache_key,
+                        is_extend: bool):
         import jax
         import torchax
 
-        # Closure captures: model + forward_batch + ctx. The ctx is rebuilt
-        # inside the body so it lives in the traced graph.
+        # Closure captures (these are static per cache_key):
+        #   model, fb (mutable container), attn_mesh, fwd_ctx, is_extend
+        # Per-call dynamic state is passed as explicit JIT args below — NEVER
+        # closure-captured — so JAX traces them as runtime inputs, not as
+        # trace-time constants. See probes 0/2/3 report in private-tool
+        # sglang/_next_prompt.md 2026-05-30 19:25 UTC for why.
         from torchax.interop import jax_view, torch_view
 
         from sglang.srt.model_executor.forward_context import forward_context
@@ -265,18 +312,28 @@ class JaxStepRunner:
         attn_mesh = self._attn_backend.mesh
         fwd_ctx = self._fwd_ctx
 
-        def step_fun(params_jax, kv_caches, input_ids_jax, positions_jax):
+        def step_fun(params_jax, kv_caches,
+                     input_ids_jax, positions_jax,
+                     seq_lens_jax, extend_seq_lens_jax, extend_prefix_lens_jax,
+                     out_cache_loc_jax, req_pool_indices_jax):
             ctx = JaxForwardContext(kv_caches=list(kv_caches), mesh=attn_mesh)
             with torchax.default_env(), set_jax_forward_context(ctx), forward_context(fwd_ctx):
                 params_torch = {
                     k: torch_view(v) for k, v in params_jax.items()
                 }
-                # Mutate the closure-captured forward_batch so the attention
-                # backend reads the same jax-staged input_ids / positions
-                # the JIT trace was called with (not the CPU torch ones from
-                # the time of compile).
+                # Mutate fb so the model's attention backend and the
+                # logits_processor see the JIT-traced runtime arrays, not
+                # the values from JIT compile time. These mutations are
+                # safe because each call into the JIT wraps fresh JAX
+                # tracers (or fresh runtime arrays) into torchax tensors.
                 fb.input_ids = torch_view(input_ids_jax)
                 fb.positions = torch_view(positions_jax)
+                fb.seq_lens = torch_view(seq_lens_jax)
+                fb.out_cache_loc = torch_view(out_cache_loc_jax)
+                fb.req_pool_indices = torch_view(req_pool_indices_jax)
+                if is_extend:
+                    fb.extend_seq_lens = torch_view(extend_seq_lens_jax)
+                    fb.extend_prefix_lens = torch_view(extend_prefix_lens_jax)
                 kwargs = {
                     "input_ids": torch_view(input_ids_jax),
                     "positions": torch_view(positions_jax),
