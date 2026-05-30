@@ -457,6 +457,17 @@ class LogitsProcessor(nn.Module):
             if hasattr(hidden_states, "_elem") and last_index.numel() == 1:
                 _i = int(last_index.item())
                 pruned_states = hidden_states[_i : _i + 1]
+                import os as _probe_os
+                if _probe_os.environ.get("SGLANG_PROBE0"):
+                    try:
+                        print(
+                            f"[PROBE0] i={_i} hidden_states.shape={tuple(hidden_states.shape)} "
+                            f"extend_seq_lens={logits_metadata.extend_seq_lens.tolist() if hasattr(logits_metadata.extend_seq_lens,'tolist') else logits_metadata.extend_seq_lens} "
+                            f"padded_static_len={logits_metadata.padded_static_len}",
+                            flush=True,
+                        )
+                    except Exception as _e_p0:
+                        print(f"[PROBE0] meta dump failed: {_e_p0}", flush=True)
             else:
                 pruned_states = hidden_states.index_select(0, last_index)
             if hidden_states_before_norm is not None:

@@ -1463,6 +1463,50 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
                 )
+            # PROBE 0.5: weight sanity sweep.
+            import os as _probe05_os
+            if _probe05_os.environ.get("SGLANG_PROBE0_5") or _probe05_os.environ.get("SGLANG_PROBE0"):
+                try:
+                    import jax.numpy as _jnp_p05
+                    _all_params = dict(self.model.named_parameters())
+                    # 3 canonical spot-checks + a sweep for any all-zero param.
+                    _spot = [
+                        "model.embed_tokens.weight",
+                        "lm_head.weight",
+                        "model.layers.15.self_attn.qkv_proj.weight",
+                        "model.layers.15.mlp.gate_up_proj.weight",
+                        "model.layers.15.self_attn.o_proj.weight",
+                        "model.layers.15.mlp.down_proj.weight",
+                        "model.layers.15.input_layernorm.weight",
+                        "model.layers.15.post_attention_layernorm.weight",
+                        "model.norm.weight",
+                    ]
+                    for _k in _spot:
+                        if _k in _all_params:
+                            _p = _all_params[_k]
+                            _arr = _p._elem if hasattr(_p, "_elem") else None
+                            if _arr is None:
+                                logger.warning("PROBE0_5 %s no _elem", _k)
+                                continue
+                            _mean = float(_arr.mean())
+                            _std = float(_arr.std())
+                            _abs_mean = float(_jnp_p05.abs(_arr).mean())
+                            _all_zero = bool((_arr == 0).all())
+                            logger.warning(
+                                "PROBE0_5 %s shape=%s mean=%.6f std=%.6f abs_mean=%.6f all_zero=%s",
+                                _k, tuple(_arr.shape), _mean, _std, _abs_mean, _all_zero,
+                            )
+                    # Sweep: any all-zero params anywhere?
+                    _zero_names = []
+                    for _k, _p in _all_params.items():
+                        if hasattr(_p, "_elem"):
+                            if bool((_p._elem == 0).all()):
+                                _zero_names.append(_k)
+                    logger.warning("PROBE0_5 zero_param_count=%d names=%s",
+                        len(_zero_names), _zero_names[:20])
+                except Exception as _e_p05:
+                    import traceback as _tb_p05
+                    logger.warning("PROBE0_5 failed: %s\n%s", _e_p05, _tb_p05.format_exc())
         # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
         if _is_npu:

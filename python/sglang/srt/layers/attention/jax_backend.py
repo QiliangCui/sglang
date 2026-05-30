@@ -208,6 +208,30 @@ class JaxAttentionBackend(AttentionBackend):
             (batch_size * pages_per_seq,), dtype=jnp.int32
         )
 
+        # PROBE 3: dump the metadata the attention kernel will see.
+        import os as _probe_os3
+        import logging as _logging3
+        if _probe_os3.environ.get("SGLANG_PROBE3"):
+            _l3 = _logging3.getLogger(__name__)
+            try:
+                _l3.warning(
+                    "PROBE3 _build_metadata: positions=%s seq_lens=%s qsl=%s "
+                    "block_tables=%s distribution=%s padded_num_reqs=%s "
+                    "fb.out_cache_loc=%s fb.req_pool_indices=%s "
+                    "fb.seq_lens=%s fb.extend_seq_lens=%s",
+                    np.asarray(input_positions).tolist(),
+                    np.asarray(seq_lens_jax).tolist(),
+                    np.asarray(qsl).tolist(),
+                    np.asarray(block_tables).tolist(),
+                    np.asarray(distribution).tolist(),
+                    batch_size,
+                    np.asarray(forward_batch.out_cache_loc).tolist() if getattr(forward_batch, "out_cache_loc", None) is not None else None,
+                    np.asarray(forward_batch.req_pool_indices).tolist() if getattr(forward_batch, "req_pool_indices", None) is not None else None,
+                    np.asarray(forward_batch.seq_lens).tolist() if forward_batch.seq_lens is not None else None,
+                    np.asarray(forward_batch.extend_seq_lens).tolist() if getattr(forward_batch, "extend_seq_lens", None) is not None else None,
+                )
+            except Exception as _e3:
+                _l3.warning("PROBE3 dump failed: %s", _e3)
         return AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables,

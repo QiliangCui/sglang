@@ -208,6 +208,35 @@ class JaxStepRunner:
         # materialize logits as a plain CPU torch.Tensor.
         logits_np = _np.asarray(logits_jax)
         logits_cpu = torch.from_numpy(logits_np)
+        # PROBE 0 / 2: per-step dump of input metadata + chosen token.
+        import os as _probe_os
+        if _probe_os.environ.get("SGLANG_PROBE0") or _probe_os.environ.get("SGLANG_PROBE2"):
+            try:
+                _top1 = int(logits_np.reshape(-1, logits_np.shape[-1])[-1].argmax())
+                _fb = forward_batch
+                _newkey = cache_key not in self._step_jits_keys_seen if hasattr(self, "_step_jits_keys_seen") else True
+                if not hasattr(self, "_step_jits_keys_seen"):
+                    self._step_jits_keys_seen = set()
+                self._step_jits_keys_seen.add(cache_key)
+                logger.warning(
+                    "PROBE step mode=%s real_n=%s bucket_n=%s bs=%s "
+                    "cache_key=%s jit_new=%s "
+                    "input_ids=%s positions=%s seq_lens=%s "
+                    "extend_seq_lens=%s extend_prefix_lens=%s out_cache_loc=%s "
+                    "req_pool_indices=%s top1=%s",
+                    mode_key, real_num_tokens, bucket_num_tokens, batch_size,
+                    cache_key, _newkey,
+                    _np.asarray(_fb.input_ids).tolist() if _fb.input_ids is not None else None,
+                    _np.asarray(_fb.positions).tolist() if _fb.positions is not None else None,
+                    _np.asarray(_fb.seq_lens).tolist() if _fb.seq_lens is not None else None,
+                    _np.asarray(_fb.extend_seq_lens).tolist() if getattr(_fb, "extend_seq_lens", None) is not None else None,
+                    _np.asarray(_fb.extend_prefix_lens).tolist() if getattr(_fb, "extend_prefix_lens", None) is not None else None,
+                    _np.asarray(_fb.out_cache_loc).tolist() if getattr(_fb, "out_cache_loc", None) is not None else None,
+                    _np.asarray(_fb.req_pool_indices).tolist() if getattr(_fb, "req_pool_indices", None) is not None else None,
+                    _top1,
+                )
+            except Exception as _e_pr:
+                logger.warning("PROBE dump failed: %s", _e_pr)
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         return LogitsProcessorOutput(
             next_token_logits=logits_cpu,
