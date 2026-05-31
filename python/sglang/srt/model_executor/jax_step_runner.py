@@ -112,11 +112,14 @@ class JaxStepRunner:
     def _allocate_kv_caches(self) -> None:
         # Pull KV layout from the model config. S3.3 will move this into
         # JaxMHATokenToKVPool; here we own it directly.
+        import jax
         import jax.numpy as jnp
+        from jax.sharding import NamedSharding, PartitionSpec as P
 
         from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
             get_kv_cache_shape,
         )
+        from tpu_inference.layers.common.sharding import ShardingAxisName2D
 
         cfg = self.model.config
         n_layers = cfg.num_hidden_layers
@@ -135,8 +138,21 @@ class JaxStepRunner:
 
         shape = get_kv_cache_shape(num_pages, page_size, n_kv, head_dim,
                                    jnp.bfloat16)
+        # Real-sharding step 1: pin per-layer KV onto the same mesh the
+        # RPA kernel uses, sharded along the head axis. At TP=1 the mesh
+        # is 1x1 and this is a no-op; at TP>1 the per-decode-step
+        # redistribute that drove the 11x/27x/51x cliff goes away. The
+        # kernel's kv_cache_spec is P(ATTN_DATA, None, ATTN_HEAD, None,
+        # None); ATTN_DATA is size 1 in our mesh shape so None vs
+        # ATTN_DATA on dim 0 is equivalent here.
+        mesh = self._attn_backend.mesh
+        kv_spec = NamedSharding(
+            mesh,
+            P(None, None, ShardingAxisName2D.ATTN_HEAD, None, None),
+        )
         self._kv_caches = [
-            jnp.zeros(shape, dtype=jnp.bfloat16) for _ in range(n_layers)
+            jax.device_put(jnp.zeros(shape, dtype=jnp.bfloat16), kv_spec)
+            for _ in range(n_layers)
         ]
         # Hand pages_per_seq + page_size to the attention backend so its
         # _build_metadata builds a block_tables shaped/valued correctly.
