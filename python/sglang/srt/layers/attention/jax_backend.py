@@ -106,6 +106,52 @@ class JaxAttentionBackend(AttentionBackend):
             type(self)._mesh = _build_default_mesh()
         self.mesh = type(self)._mesh
 
+        # Force smaller RPA kernel block tiles on tpu7x. Default
+        # `p_block_sizes=(bq, bkv, bq_csz, bkv_csz)` from the kernel is
+        # `(512, 2048, 256, 512)`, needing ~76 MB VMEM scratch — exceeds
+        # the 64 MB tpu7x VMEM cap, so bucket=1024 prefill crashes with
+        # RESOURCE_EXHAUSTED. Pre-S5 we override to halve the query block
+        # to fit. (vmem_limit_bytes default IS the TPU's capacity, so
+        # passing it as a kwarg doesn't change anything.) Step 1 fix from
+        # `_next_prompt.md` REVIEWER 2026-05-31 00:30 UTC.
+        type(self)._patch_rpa_block_sizes_once()
+
+    @classmethod
+    def _patch_rpa_block_sizes_once(cls) -> None:
+        if getattr(cls, "_rpa_blocks_patched", False):
+            return
+        cls._rpa_blocks_patched = True
+        try:
+            from tpu_inference.kernels.ragged_paged_attention.v3 import (
+                kernel as _rpa_kernel,
+            )
+            from tpu_inference.layers.common import attention_interface as _ai
+        except ImportError:  # pragma: no cover
+            return
+
+        _orig = _rpa_kernel.ragged_paged_attention
+        # (bq_sz, bkv_sz, bq_csz, bkv_csz). Empirically smaller-than-
+        # default values that fit tpu7x VMEM at bucket=1024.
+        _P_BLOCK = (128, 1024, 128, 256)
+        _D_BLOCK = (32, 1024, 32, 256)
+        _M_BLOCK = (128, 1024, 128, 256)
+
+        def _patched(*args, **kwargs):
+            if "p_block_sizes" not in kwargs or kwargs["p_block_sizes"] is None:
+                kwargs["p_block_sizes"] = _P_BLOCK
+            if "d_block_sizes" not in kwargs or kwargs["d_block_sizes"] is None:
+                kwargs["d_block_sizes"] = _D_BLOCK
+            if "m_block_sizes" not in kwargs or kwargs["m_block_sizes"] is None:
+                kwargs["m_block_sizes"] = _M_BLOCK
+            return _orig(*args, **kwargs)
+
+        _rpa_kernel.ragged_paged_attention = _patched
+        # `attention_interface` rebinds the symbol at module-import time,
+        # so patching only `_rpa_kernel` won't be picked up by callers in
+        # `sharded_ragged_paged_attention`. Patch both.
+        if hasattr(_ai, "ragged_paged_attention"):
+            _ai.ragged_paged_attention = _patched
+
     @property
     def mesh_obj(self) -> Mesh:
         return self.mesh
