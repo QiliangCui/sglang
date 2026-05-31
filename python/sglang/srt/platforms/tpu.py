@@ -80,7 +80,12 @@ class TpuDeviceMixin(DeviceMixin):
         import jax
 
         try:
-            mem = jax.devices()[device_id].memory_stats()
+            # At TP>1 each JAX process sees only its own subset of devices,
+            # all starting from index 0. The caller passes self.gpu_id which
+            # is the global local_rank — at TP=2, rank 1 would IndexError on
+            # `jax.devices()[1]` if the process only owns 1 device. Always
+            # query [0] since memory-per-chip is uniform within a process.
+            mem = jax.devices()[0].memory_stats()
             return int(mem.get("bytes_limit") or mem.get("bytes_in_use") or 0)
         except Exception:
             return 32 * 1024**3
@@ -226,6 +231,18 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
         # Mark THIS process as libtpu-initialized so the device-query
         # methods (get_device_total_memory etc) start using jax.devices().
         _TpuFlag.ready = True
+
+        # TP=2+ pre-req: torch.distributed.barrier() calls
+        # torch._C._get_accelerator() which fails on the torchax-registered
+        # PrivateUse1 backend with "Please register PrivateUse1HooksInterface
+        # by RegisterPrivateUse1HooksInterface first." Re-route the call to
+        # report CPU so the gloo barrier uses CPU device (matches the
+        # gloo backend choice from _DEVICE_TO_DISTRIBUTED_BACKEND["jax"]).
+        # See s5_walls.md wall 1.
+        import torch as _torch
+        if not getattr(_torch._C, "_sglang_tpu_accel_patched", False):
+            _torch._C._get_accelerator = lambda: _torch.device("cpu")
+            _torch._C._sglang_tpu_accel_patched = True
         """Actual body. Wrapped so we can verify firing from logs.
 
         Order matters:
