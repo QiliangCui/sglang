@@ -403,6 +403,56 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
             # Qwen3 module not importable on this build; nothing to patch.
             pass
 
+        # 4.6 Real-sharding step 4: patch `RowParallelLinear.forward` to use
+        #     the pre-sharded weight set by `pre_shard_row_parallel_weights`
+        #     in `JaxStepRunner._ensure_setup`. Model-agnostic (works for
+        #     o_proj on Qwen3, Llama, etc., and for down_proj later). Two
+        #     short-circuits: (i) TP=1, no pre-shard; (ii) module has no
+        #     `_sglang_w_sharded` (not in this step's name_filter).
+        #     Idempotent.
+        try:
+            from sglang.srt.layers import linear as _linear_mod
+            if not getattr(
+                _linear_mod.RowParallelLinear, "_sglang_tpu_row_shard_patched", False
+            ):
+                _orig_rp_forward = _linear_mod.RowParallelLinear.forward
+
+                def _patched_row_parallel_forward(
+                    self, input_, skip_all_reduce=False, forward_batch=None
+                ):
+                    from sglang.srt.layers.jax_sharding_helpers import (
+                        is_sharding_active,
+                        sharded_row_parallel_matmul,
+                    )
+                    if not is_sharding_active() or not hasattr(
+                        self, "_sglang_w_sharded"
+                    ):
+                        return _orig_rp_forward(
+                            self,
+                            input_,
+                            skip_all_reduce=skip_all_reduce,
+                            forward_batch=forward_batch,
+                        )
+                    from torchax.interop import jax_view
+                    from torchax.tensor import Tensor as _TxTensor
+                    import torchax as _txa
+                    env = _txa.default_env()
+                    inp_jax = jax_view(input_)
+                    bias_jax = None
+                    if self.bias is not None and not self.skip_bias_add:
+                        bias_jax = jax_view(self.bias)
+                    out_jax = sharded_row_parallel_matmul(
+                        inp_jax, self._sglang_w_sharded, bias=bias_jax
+                    )
+                    out = _TxTensor(out_jax, env)
+                    out_bias = self.bias if self.skip_bias_add else None
+                    return out, out_bias
+
+                _linear_mod.RowParallelLinear.forward = _patched_row_parallel_forward
+                _linear_mod.RowParallelLinear._sglang_tpu_row_shard_patched = True
+        except Exception:
+            pass
+
         # 5. Unwrap @torch.compile that was bound at import time (before
         #    step 2 took effect). Currently known: sampler.multinomial_with_seed.
         try:

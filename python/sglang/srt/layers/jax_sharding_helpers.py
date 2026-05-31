@@ -189,3 +189,80 @@ def pre_shard_qkv_weights(model, mesh) -> int:
             module._sglang_v_weight_sharded = v_w
             count += 1
     return count
+
+
+def shard_row_parallel_weight(weight, mesh):
+    """Shard a row-parallel linear's weight along its INPUT (column) dim along
+    ATTN_HEAD.
+
+    Args:
+      weight: `jax.Array` shape `[out, in]` (sglang Linear convention).
+      mesh: `Mesh` with `model` axis = ATTN_HEAD.
+
+    Returns:
+      `jax.Array` sharded with `P(None, "model")` — each device owns a
+      contiguous column slice of size `in / N`.
+
+    The row-parallel pattern: when the matmul's INPUT is also sharded on the
+    same axis (e.g., RPA kernel output sharded by ATTN_HEAD on heads dim,
+    which becomes the input cols dim of o_proj), each device computes a partial
+    `[batch, out]` sum. JAX inserts an `all-reduce` along the `model` axis to
+    sum the partials into the final result.
+    """
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    return jax.device_put(weight, NamedSharding(mesh, P(None, "model")))
+
+
+def sharded_row_parallel_matmul(input_arr, weight_col_sharded, bias=None):
+    """Matmul for a row-parallel linear: `input @ weight.T + bias`.
+
+    When `input_arr` is already sharded on its last dim by `model` axis (which
+    matches `weight_col_sharded`'s col dim), each device computes a partial
+    `[batch, out]`. JAX's auto-redistribute + the matching shardings cause an
+    implicit `psum`/`all-reduce` to sum partials. If `input_arr` is replicated
+    instead, JAX slices it on the fly — same end result, slightly less optimal.
+
+    Returns `jax.Array` with replicated last dim (the summed result).
+    """
+    out = input_arr @ weight_col_sharded.T
+    if bias is not None:
+        out = out + bias
+    return out
+
+
+def pre_shard_row_parallel_weights(model, mesh, name_filter) -> int:
+    """Walk `model.modules()` once and shard every linear submodule whose
+    attribute name on its parent matches `name_filter` (a set or tuple of
+    strings, e.g., `{"o_proj"}` for Step 4, `{"o_proj", "down_proj"}` later).
+
+    The filter applies to ATTRIBUTE NAME — we walk parent modules and look at
+    their named children to find e.g. `Qwen3Attention.o_proj`. The child's
+    `.weight` is sharded in place via `shard_row_parallel_weight`. The child
+    module gets `_sglang_w_sharded` set so the patched `RowParallelLinear.forward`
+    in tpu.py can pick it up.
+
+    Returns count of weights sharded. Idempotent. TP=1 no-op.
+
+    MUST run outside any `jax.jit` trace.
+    """
+    if not is_sharding_active(mesh):
+        return 0
+    import torchax
+    from torchax.interop import jax_view
+
+    filter_set = set(name_filter)
+    count = 0
+    with torchax.default_env():
+        for module in model.modules():
+            for attr_name, child in module.named_children():
+                if attr_name not in filter_set:
+                    continue
+                if getattr(child, "_sglang_w_sharded", None) is not None:
+                    continue
+                if not hasattr(child, "weight"):
+                    continue
+                w_jax = jax_view(child.weight)
+                child._sglang_w_sharded = shard_row_parallel_weight(w_jax, mesh)
+                count += 1
+    return count

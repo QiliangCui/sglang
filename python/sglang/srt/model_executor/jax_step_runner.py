@@ -132,6 +132,30 @@ class JaxStepRunner:
                 _e_shard,
             )
 
+        # Real-sharding step 4: pre-shard o_proj (row-parallel input dim).
+        # down_proj is held back until Step 3 lands gate_up sharding — at
+        # decode batch=1 with REPLICATED input, sharding only down_proj adds
+        # a collective without compute savings (per implementer's analysis
+        # in step-4 IMPLEMENTER block).
+        try:
+            from sglang.srt.layers.jax_sharding_helpers import (
+                pre_shard_row_parallel_weights,
+            )
+            _n_o = pre_shard_row_parallel_weights(
+                self.model, self._attn_backend.mesh, name_filter={"o_proj"}
+            )
+            if _n_o > 0:
+                logger.info(
+                    "JaxStepRunner pre-sharded %d o_proj weights (row-parallel, col dim) along ATTN_HEAD.",
+                    _n_o,
+                )
+        except Exception as _e_shard_rp:
+            logger.warning(
+                "JaxStepRunner pre_shard_row_parallel_weights(o_proj) failed: %s "
+                "(continuing with replicated o_proj)",
+                _e_shard_rp,
+            )
+
     def _allocate_kv_caches(self) -> None:
         # Pull KV layout from the model config. S3.3 will move this into
         # JaxMHATokenToKVPool; here we own it directly.
