@@ -109,6 +109,29 @@ class JaxStepRunner:
         # Allocate KV caches sized to model_config.
         self._allocate_kv_caches()
 
+        # Real-sharding step 2: pre-shard qkv_proj.weight on every attention
+        # block. MUST happen here (outside any JIT trace) so the sharded
+        # outputs aren't traced values escaping the step_fun scope. The
+        # patched Qwen3Attention.forward_prepare_native picks up the
+        # pre-sharded weights via module attributes. At TP=1 this is a no-op
+        # (the helper short-circuits on `is_sharding_active`).
+        try:
+            from sglang.srt.layers.jax_sharding_helpers import (
+                pre_shard_qkv_weights,
+            )
+            _n_qkv = pre_shard_qkv_weights(self.model, self._attn_backend.mesh)
+            if _n_qkv > 0:
+                logger.info(
+                    "JaxStepRunner pre-sharded %d qkv_proj weights along ATTN_HEAD.",
+                    _n_qkv,
+                )
+        except Exception as _e_shard:
+            logger.warning(
+                "JaxStepRunner pre_shard_qkv_weights failed: %s "
+                "(continuing with replicated qkv)",
+                _e_shard,
+            )
+
     def _allocate_kv_caches(self) -> None:
         # Pull KV layout from the model config. S3.3 will move this into
         # JaxMHATokenToKVPool; here we own it directly.

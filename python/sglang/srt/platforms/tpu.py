@@ -341,6 +341,68 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
             # S3 hasn't landed the JAX backend module yet.
             pass
 
+        # 4.5 Install Qwen3Attention.forward_prepare_native patch for real-TP
+        #     sharding (real-sharding step 2). Glue is thin (~25 lines); all
+        #     sharding logic lives in
+        #     `sglang.srt.layers.jax_sharding_helpers`. At TP=1 the patch
+        #     short-circuits to the original implementation, so no behavior
+        #     change. Idempotent.
+        try:
+            from sglang.srt.models import qwen3 as _qwen3_mod
+            if not getattr(_qwen3_mod.Qwen3Attention, "_sglang_tpu_qkv_shard_patched", False):
+                _orig_prepare_native = _qwen3_mod.Qwen3Attention.forward_prepare_native
+
+                def _patched_forward_prepare_native(self, positions, hidden_states):
+                    # Lazy import keeps cold path off non-TPU runs.
+                    from sglang.srt.layers.jax_sharding_helpers import (
+                        is_sharding_active,
+                        sharded_qkv_matmul,
+                    )
+                    # Two short-circuits to the original path:
+                    #   (1) TP=1 (1x1 mesh) — sharding is a strict no-op.
+                    #   (2) Pre-shard hasn't run yet (e.g. on a model class the
+                    #       generic discovery rule didn't match). Falling back
+                    #       keeps correctness; the warning in step-runner
+                    #       captures the no-shard case.
+                    if not is_sharding_active() or not hasattr(
+                        self, "_sglang_q_weight_sharded"
+                    ):
+                        return _orig_prepare_native(self, positions, hidden_states)
+                    from torchax.interop import jax_view
+                    from torchax.tensor import Tensor as _TxTensor
+                    h_jax = jax_view(hidden_states)
+                    q_j, k_j, v_j = sharded_qkv_matmul(
+                        h_jax,
+                        self._sglang_q_weight_sharded,
+                        self._sglang_k_weight_sharded,
+                        self._sglang_v_weight_sharded,
+                    )
+                    # Wrap back as torchax tensors so apply_qk_norm + rotary_emb
+                    # (which call torch ops) compose normally.
+                    import torchax as _txa
+                    env = _txa.default_env()
+                    q = _TxTensor(q_j, env)
+                    k = _TxTensor(k_j, env)
+                    v = _TxTensor(v_j, env)
+                    # Same downstream as the original: QK norm + rotary on q/k.
+                    from sglang.srt.models.utils import apply_qk_norm
+                    q, k = apply_qk_norm(
+                        q=q,
+                        k=k,
+                        q_norm=self.q_norm,
+                        k_norm=self.k_norm,
+                        head_dim=self.head_dim,
+                        alt_stream=self.alt_stream,
+                    )
+                    q, k = self.rotary_emb(positions, q, k)
+                    return q, k, v
+
+                _qwen3_mod.Qwen3Attention.forward_prepare_native = _patched_forward_prepare_native
+                _qwen3_mod.Qwen3Attention._sglang_tpu_qkv_shard_patched = True
+        except Exception:
+            # Qwen3 module not importable on this build; nothing to patch.
+            pass
+
         # 5. Unwrap @torch.compile that was bound at import time (before
         #    step 2 took effect). Currently known: sampler.multinomial_with_seed.
         try:
