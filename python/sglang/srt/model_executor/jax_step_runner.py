@@ -186,6 +186,25 @@ class JaxStepRunner:
                 _e_shard_gu,
             )
 
+        # Real-sharding step 6: log per-device memory after pre-shard so
+        # the structural memory win is measurable. `memory_stats()` returns
+        # None on non-TPU platforms, in which case we skip silently.
+        try:
+            import jax as _jax_mem
+            for _i, _dev in enumerate(_jax_mem.devices()):
+                _stats = _dev.memory_stats()
+                if _stats is None:
+                    continue
+                _in_use_gb = _stats.get("bytes_in_use", 0) / (1024 ** 3)
+                _peak_gb = _stats.get("peak_bytes_in_use", 0) / (1024 ** 3)
+                _limit_gb = _stats.get("bytes_reservable_limit", 0) / (1024 ** 3)
+                logger.info(
+                    "POST_SHARD_MEM dev=%d in_use=%.3f GB peak=%.3f GB limit=%.3f GB",
+                    _i, _in_use_gb, _peak_gb, _limit_gb,
+                )
+        except Exception as _e_mem:
+            logger.warning("POST_SHARD_MEM probe failed: %s", _e_mem)
+
     def _allocate_kv_caches(self) -> None:
         # Pull KV layout from the model config. S3.3 will move this into
         # JaxMHATokenToKVPool; here we own it directly.
