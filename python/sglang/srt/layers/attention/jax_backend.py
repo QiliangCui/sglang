@@ -61,17 +61,28 @@ if TYPE_CHECKING:
 
 
 def _build_default_mesh() -> Mesh:
-    """Single-device mesh (ATTN_DATA=1, ATTN_HEAD=1).
+    """JAX mesh shaped by the SGLANG_JAX_MESH_TP env var (set by the
+    TPU single-process TP path in `entrypoints/engine.py`). Defaults
+    to a 1×1 mesh for `--tp-size 1`.
 
-    S5 will replace this with a multi-chip mesh constructed against the
-    server_args.tp_size etc. (`sglang_tpu.mesh.get_or_create_mesh` in
-    plan §S3.6).
+    Mesh shape is (ATTN_DATA=1, ATTN_HEAD=tp). At TP>1 the RPA kernel
+    shards along the head axis (matching tpu_inference's
+    sharded_ragged_paged_attention which reads tp_size from the mesh
+    via `get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)`).
     """
     # Import inside the function so tpu_inference loads lazily — keeps
     # the cost off the sglang `import` cold path for non-TPU runs.
+    import os as _os_mesh
     from tpu_inference.layers.common.sharding import ShardingAxisName2D
 
-    devs = np.array(jax.devices()[:1]).reshape(1, 1)
+    _tp = int(_os_mesh.environ.get("SGLANG_JAX_MESH_TP", "1"))
+    _all_devices = jax.devices()
+    if _tp > len(_all_devices):
+        raise RuntimeError(
+            f"SGLANG_JAX_MESH_TP={_tp} but only {len(_all_devices)} JAX "
+            f"devices visible. Are all chips claimed by this process?"
+        )
+    devs = np.array(_all_devices[:_tp]).reshape(1, _tp)
     return Mesh(
         devs,
         axis_names=(ShardingAxisName2D.ATTN_DATA, ShardingAxisName2D.ATTN_HEAD),
