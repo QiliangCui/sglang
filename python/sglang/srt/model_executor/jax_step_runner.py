@@ -132,28 +132,58 @@ class JaxStepRunner:
                 _e_shard,
             )
 
-        # Real-sharding step 4: pre-shard o_proj (row-parallel input dim).
-        # down_proj is held back until Step 3 lands gate_up sharding — at
-        # decode batch=1 with REPLICATED input, sharding only down_proj adds
-        # a collective without compute savings (per implementer's analysis
-        # in step-4 IMPLEMENTER block).
+        # Real-sharding step 4 + step 3: shard the two row-parallel linears
+        # together (o_proj from attention, down_proj from mlp). down_proj is
+        # paired with gate_up below — sharding only down_proj while gate_up
+        # is still replicated would add a collective without compute savings
+        # (per step-4 analysis). Sharding both lets gate_up's sharded output
+        # flow directly into down_proj's sharded input with no intermediate
+        # all-gather.
         try:
             from sglang.srt.layers.jax_sharding_helpers import (
                 pre_shard_row_parallel_weights,
             )
-            _n_o = pre_shard_row_parallel_weights(
-                self.model, self._attn_backend.mesh, name_filter={"o_proj"}
+            _n_rp = pre_shard_row_parallel_weights(
+                self.model,
+                self._attn_backend.mesh,
+                name_filter={"o_proj", "down_proj"},
             )
-            if _n_o > 0:
+            if _n_rp > 0:
                 logger.info(
-                    "JaxStepRunner pre-sharded %d o_proj weights (row-parallel, col dim) along ATTN_HEAD.",
-                    _n_o,
+                    "JaxStepRunner pre-sharded %d row-parallel weights "
+                    "(o_proj + down_proj, col dim) along ATTN_HEAD.",
+                    _n_rp,
                 )
         except Exception as _e_shard_rp:
             logger.warning(
-                "JaxStepRunner pre_shard_row_parallel_weights(o_proj) failed: %s "
-                "(continuing with replicated o_proj)",
+                "JaxStepRunner pre_shard_row_parallel_weights failed: %s "
+                "(continuing with replicated row-parallel weights)",
                 _e_shard_rp,
+            )
+
+        # Real-sharding step 3: pre-shard gate_up_proj (column-parallel,
+        # combined gate||up layout). Each device ends up owning its
+        # intermediate-dim slice of the SwiGLU pre-activation. Paired with
+        # down_proj's row-parallel shard above so the sharded intermediate
+        # flows in without an intermediate all-gather.
+        try:
+            from sglang.srt.layers.jax_sharding_helpers import (
+                pre_shard_gate_up_weights,
+            )
+            _n_gu = pre_shard_gate_up_weights(
+                self.model, self._attn_backend.mesh
+            )
+            if _n_gu > 0:
+                logger.info(
+                    "JaxStepRunner pre-sharded %d gate_up_proj weights "
+                    "(col-parallel, intermediate dim) along ATTN_HEAD.",
+                    _n_gu,
+                )
+        except Exception as _e_shard_gu:
+            logger.warning(
+                "JaxStepRunner pre_shard_gate_up_weights failed: %s "
+                "(continuing with replicated gate_up_proj)",
+                _e_shard_gu,
             )
 
     def _allocate_kv_caches(self) -> None:

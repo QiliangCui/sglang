@@ -453,6 +453,48 @@ class TpuSRTPlatform(TpuDeviceMixin, SRTPlatform):
         except Exception:
             pass
 
+        # 4.7 Real-sharding step 3: patch Qwen2MLP.forward (aka Qwen3MLP via
+        #     alias in qwen3.py) to use the pre-sharded gate_up weights via
+        #     `sharded_mlp_silu_up`, then call the existing self.down_proj
+        #     which now hits the patched RowParallelLinear.forward with its
+        #     own sharded weight. Short-circuits when sharding isn't active
+        #     or pre-shard hasn't run.
+        try:
+            from sglang.srt.models import qwen2 as _qwen2_mod
+            if not getattr(
+                _qwen2_mod.Qwen2MLP, "_sglang_tpu_mlp_shard_patched", False
+            ):
+                _orig_mlp_forward = _qwen2_mod.Qwen2MLP.forward
+
+                def _patched_mlp_forward(self, x, forward_batch=None):
+                    from sglang.srt.layers.jax_sharding_helpers import (
+                        is_sharding_active,
+                        sharded_mlp_silu_up,
+                    )
+                    if not is_sharding_active() or not hasattr(
+                        self.gate_up_proj, "_sglang_gate_w_sharded"
+                    ):
+                        return _orig_mlp_forward(self, x, forward_batch=forward_batch)
+                    from torchax.interop import jax_view
+                    from torchax.tensor import Tensor as _TxTensor
+                    import torchax as _txa
+                    env = _txa.default_env()
+                    x_jax = jax_view(x)
+                    inter_jax = sharded_mlp_silu_up(
+                        x_jax,
+                        self.gate_up_proj._sglang_gate_w_sharded,
+                        self.gate_up_proj._sglang_up_w_sharded,
+                    )
+                    inter = _TxTensor(inter_jax, env)
+                    # down_proj's patched forward picks up its own sharded weight.
+                    out, _ = self.down_proj(inter, forward_batch=forward_batch)
+                    return out
+
+                _qwen2_mod.Qwen2MLP.forward = _patched_mlp_forward
+                _qwen2_mod.Qwen2MLP._sglang_tpu_mlp_shard_patched = True
+        except Exception:
+            pass
+
         # 5. Unwrap @torch.compile that was bound at import time (before
         #    step 2 took effect). Currently known: sampler.multinomial_with_seed.
         try:

@@ -231,6 +231,90 @@ def sharded_row_parallel_matmul(input_arr, weight_col_sharded, bias=None):
     return out
 
 
+def shard_gate_up_weight(gate_up_weight, intermediate_size: int, mesh):
+    """Slice a combined `[2*intermediate_size, hidden]` gate_up_proj weight
+    into gate and up halves; shard each on the intermediate row dim along
+    ATTN_HEAD.
+
+    Args:
+      gate_up_weight: `jax.Array` shape `[2*intermediate_size, hidden]`.
+        sglang's `MergedColumnParallelLinear` lays out gate first, then up.
+      intermediate_size: gate (and up) row count per half.
+      mesh: `Mesh` with `model` axis = ATTN_HEAD.
+
+    Returns:
+      `(gate_weight, up_weight)` each `jax.Array` sharded with
+      `P("model", None)`. Per device: `[intermediate_size/N, hidden]`.
+
+    The matmul output of `hidden @ gate_w.T` (where hidden is replicated and
+    gate_w is row-sharded along intermediate) emits a tensor sharded last-dim
+    by ATTN_HEAD. The downstream `silu(gate) * up` is element-wise and
+    preserves sharding. The result flows naturally into a `down_proj` that's
+    col-sharded on intermediate — no all-gather between gate_up and down.
+    """
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    gate_repl = gate_up_weight[:intermediate_size, :]
+    up_repl = gate_up_weight[intermediate_size:2 * intermediate_size, :]
+    spec = NamedSharding(mesh, P("model", None))
+    return (
+        jax.device_put(gate_repl, spec),
+        jax.device_put(up_repl, spec),
+    )
+
+
+def sharded_mlp_silu_up(hidden, gate_weight_sharded, up_weight_sharded):
+    """SwiGLU intermediate from sharded gate/up weights.
+
+    `hidden`: `jax.Array` shape `[batch, hidden]`, replicated.
+    Returns: `jax.Array` shape `[batch, intermediate_size]` sharded last-dim
+    by ATTN_HEAD.
+    """
+    import jax
+    gate_out = hidden @ gate_weight_sharded.T
+    up_out = hidden @ up_weight_sharded.T
+    return jax.nn.silu(gate_out) * up_out
+
+
+def pre_shard_gate_up_weights(model, mesh) -> int:
+    """Walk `model.modules()` and shard every `gate_up_proj` child via
+    `shard_gate_up_weight`. Discovery rule: attribute `gate_up_proj` on a
+    parent module, with a `.weight` whose first dim is even (so we can split
+    into gate || up). Sets `_sglang_gate_w_sharded` and `_sglang_up_w_sharded`
+    on the child. Idempotent. TP=1 no-op.
+
+    MUST run outside any `jax.jit` trace.
+    """
+    if not is_sharding_active(mesh):
+        return 0
+    import torchax
+    from torchax.interop import jax_view
+
+    count = 0
+    with torchax.default_env():
+        for module in model.modules():
+            for attr_name, child in module.named_children():
+                if attr_name != "gate_up_proj":
+                    continue
+                if getattr(child, "_sglang_gate_w_sharded", None) is not None:
+                    continue
+                if not hasattr(child, "weight"):
+                    continue
+                w_jax = jax_view(child.weight)
+                # sglang's MergedColumnParallelLinear lays gate||up as rows.
+                # weight shape = [2 * intermediate_size, hidden].
+                if w_jax.shape[0] % 2 != 0:
+                    continue
+                intermediate_size = w_jax.shape[0] // 2
+                gate_w, up_w = shard_gate_up_weight(
+                    w_jax, intermediate_size, mesh
+                )
+                child._sglang_gate_w_sharded = gate_w
+                child._sglang_up_w_sharded = up_w
+                count += 1
+    return count
+
+
 def pre_shard_row_parallel_weights(model, mesh, name_filter) -> int:
     """Walk `model.modules()` once and shard every linear submodule whose
     attribute name on its parent matches `name_filter` (a set or tuple of
