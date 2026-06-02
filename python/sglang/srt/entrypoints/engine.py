@@ -583,6 +583,24 @@ class Engine(EngineScoreMixin, EngineBase):
             )
             scheduler_pipe_readers = []
 
+            # TPU single-process TP path (S5 wall 3 fix, per
+            # `_next_prompt.md` REVIEWER 2026-05-31 02:15 UTC and
+            # kb_tpu_inference_torchax.md §6.1): even at --tp-size N,
+            # spawn ONE worker. That worker owns all of the JAX mesh
+            # internally (`jax.sharding.Mesh(jax.devices()[:N])`). The
+            # multi-process libtpu race we navigated for TP=1 (walls 7,
+            # 8, 12) doesn't reopen.
+            import os as _os_tpu
+            from sglang.srt.platforms import current_platform as _cp_tpu
+            if _cp_tpu.is_tpu() and server_args.tp_size > 1:
+                _os_tpu.environ["SGLANG_JAX_MESH_TP"] = str(server_args.tp_size)
+                logger.info(
+                    "TPU single-process TP: --tp-size %d will be served "
+                    "by 1 sglang worker with a %d-device JAX mesh.",
+                    server_args.tp_size, server_args.tp_size,
+                )
+                server_args.tp_size = 1
+
             pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
                 _calculate_rank_ranges(
                     server_args.nnodes,

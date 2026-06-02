@@ -1826,20 +1826,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ]
 
         _pin = is_pin_memory_available(self.device)
+        # TPU: torch can't move to device='jax' outside torchax.default_env;
+        # keep CPU tensors and let JaxStepRunner move them inside step().
+        _is_jax = isinstance(self.device, str) and self.device == "jax"
+        def _to_dev(t):
+            return t if _is_jax else t.to(self.device, non_blocking=True)
+
         input_ids_tensor = flatten_arrays_to_int64_tensor(input_ids, self.device, _pin)
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
-            self.device, non_blocking=True
+        seq_lens_tensor = _to_dev(
+            torch.tensor(seq_lens, dtype=torch.int64, pin_memory=(_pin and not _is_jax))
         )
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        orig_seq_lens_tensor = torch.tensor(
-            orig_seq_lens, dtype=torch.int32, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        orig_seq_lens_tensor = _to_dev(
+            torch.tensor(orig_seq_lens, dtype=torch.int32, pin_memory=(_pin and not _is_jax))
+        )
 
         token_type_ids_tensor = None
         if len(token_type_ids) > 0:
-            token_type_ids_tensor = torch.tensor(
-                sum(token_type_ids, []), dtype=torch.int64, pin_memory=_pin
-            ).to(self.device, non_blocking=True)
+            token_type_ids_tensor = _to_dev(
+                torch.tensor(
+                    sum(token_type_ids, []),
+                    dtype=torch.int64,
+                    pin_memory=(_pin and not _is_jax),
+                )
+            )
 
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens

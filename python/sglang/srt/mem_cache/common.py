@@ -443,17 +443,23 @@ def alloc_for_extend(
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
+    # TPU: skip .to('jax') outside torchax.default_env (JaxStepRunner
+    # converts at step entry).
+    _is_jax = isinstance(batch.device, str) and batch.device == "jax"
+    def _to_dev(t):
+        return t if _is_jax else t.to(batch.device, non_blocking=True)
+
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
     extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
-    prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
-    extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+    prefix_lens_device = _to_dev(prefix_lens_cpu)
+    extend_lens_device = _to_dev(extend_lens_cpu)
 
     # Allocate req slots
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-    req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+    req_pool_indices_device = _to_dev(req_pool_indices_cpu)
 
     # Allocate KV cache (throws exception on failure)
     if batch.tree_cache.page_size == 1:

@@ -241,7 +241,12 @@ if _is_npu:
 
     init_npu_backend()
 elif current_platform.is_out_of_tree():
+    # OOT platforms: keep module-import init (original behavior).
     current_platform.init_backend()
+# In-tree TPU: defer init_backend to ModelRunner.__init__ so it only fires
+# in the worker process. Importing model_runner in the parent (e.g. for
+# `from .model_runner import ModelRunner`) must not init libtpu — the
+# parent must not claim TPU devices the worker needs.
 
 MLA_ATTENTION_BACKENDS = [
     "aiter",
@@ -514,6 +519,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cpu":
             self.init_threads_binding()
 
+        # TPU: init_backend was deferred from model_runner module-import to
+        # here so it only fires in the worker process that actually loads
+        # the model (scheduler). Parent and non-model workers (tokenizer,
+        # detokenizer, router) keep JAX_PLATFORMS=cpu so they don't claim
+        # /dev/vfio/* — otherwise multiple workers race for the same
+        # devices and fail with "Device or resource busy".
+        if current_platform.is_tpu():
+            import os as _os
+            if _os.environ.get("JAX_PLATFORMS") == "cpu":
+                del _os.environ["JAX_PLATFORMS"]
+            current_platform.init_backend()
+
         # Get available memory before model loading
         pre_model_load_memory = self.init_torch_distributed()
 
@@ -747,7 +764,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.configure_kv_cache_dtype()
 
         # Init memory pool and attention backends
-        self.init_memory_pool(pre_model_load_memory)
+        # On TPU, memory_pool.__init__ calls torch.empty(device='jax')
+        # which needs torchax.default_env() active for dispatch.
+        if current_platform.is_tpu():
+            import torchax as _tpx
+            with _tpx.default_env():
+                self.init_memory_pool(pre_model_load_memory)
+        else:
+            self.init_memory_pool(pre_model_load_memory)
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
@@ -821,8 +845,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
 
-        # Initialize piecewise CUDA graph
-        self.init_piecewise_cuda_graphs()
+        # Initialize piecewise CUDA graph (skipped on TPU — support
+        # disabled by current_platform.support_piecewise_cuda_graph and
+        # the call itself would torch.zeros(device='jax') outside
+        # default_env).
+        if not current_platform.is_tpu():
+            self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
 
@@ -1299,10 +1327,130 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
             self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
         )
+        # TPU: wrap model load in torchax.default_env() so torch ops
+        # (torch.empty, torch.zeros, etc.) inside the model __init__
+        # dispatch to JAX. Without this, every parameter alloc raises
+        # "Could not run 'aten::empty.memory_format' from the 'jax' backend".
+        import contextlib
+        if current_platform.is_tpu():
+            # Workaround for stale libtpu lockfile when this is the first
+            # process to touch TPU. Without this, the worker fails with
+            # "ABORTED: Internal error when accessing libtpu multi-process
+            # lockfile". Race-safe because workers run sequentially today
+            # (single TP=1 worker for MVP).
+            import os as _os
+            try:
+                _os.remove("/tmp/libtpu_lockfile")
+            except FileNotFoundError:
+                pass
+            import torchax
+            # `torch.no_grad()` is required so weight_loader's
+            # `param.data.copy_(...)` doesn't trip "leaf Variable that
+            # requires grad" under torchax.
+            class _TPULoadCtx:
+                def __enter__(self):
+                    self._env = torchax.default_env().__enter__()
+                    self._grad = torch.no_grad().__enter__()
+                    return self
+                def __exit__(self, *exc):
+                    torch.no_grad().__exit__(*exc)
+                    self._env.__exit__(*exc)
+            _load_ctx = _TPULoadCtx()
+            # Patch every weight_loader call site (default_weight_loader,
+            # VocabParallelEmbedding.weight_loader, linear weight loaders)
+            # to bypass param.data.copy_ — under torchax 0.0.11 + torch
+            # 2.11 the dispatch silently leaves the underlying jax array
+            # at zero. Direct _elem assignment via a helper avoids the
+            # broken dispatch.
+            import jax.numpy as _jnp_load
+            import numpy as _np_load
+            def _direct_assign(param, loaded_weight, shard_dim=None,
+                               shard_start=None, shard_size=None):
+                """Write loaded_weight (CPU torch) into param's jax _elem."""
+                _t = loaded_weight.detach()
+                # numpy doesn't support bfloat16; promote to float32 for the
+                # host bridge, jax converts back to bf16 via dtype.
+                if _t.dtype == torch.bfloat16:
+                    _t = _t.float()
+                _src = _np_load.asarray(_t)
+                if shard_dim is not None and shard_size is not None:
+                    _slc = [slice(None)] * _src.ndim
+                    _slc[shard_dim] = slice(shard_start, shard_start + shard_size)
+                    _src = _src[tuple(_slc)]
+                param._elem = _jnp_load.asarray(_src, dtype=param._elem.dtype)
+
+            # 1) default_weight_loader
+            import sglang.srt.model_loader.weight_utils as _wu
+            _orig_default = _wu.default_weight_loader
+            def _patched_default(param, loaded_weight):
+                if hasattr(param, "_elem"):
+                    _direct_assign(param, loaded_weight)
+                    return
+                _orig_default(param, loaded_weight)
+            _wu.default_weight_loader = _patched_default
+
+            # 2) VocabParallelEmbedding.weight_loader
+            from sglang.srt.layers import vocab_parallel_embedding as _vpe
+            _orig_vpe_loader = _vpe.VocabParallelEmbedding.weight_loader
+            def _patched_vpe_loader(self, param, loaded_weight):
+                if hasattr(param, "_elem"):
+                    output_dim = getattr(param, "output_dim", None)
+                    if output_dim is None:
+                        _direct_assign(param, loaded_weight)
+                        return
+                    start = self.shard_indices.org_vocab_start_index
+                    size = self.shard_indices.org_vocab_end_index - start
+                    _direct_assign(param, loaded_weight,
+                        shard_dim=output_dim, shard_start=start, shard_size=size)
+                    return
+                _orig_vpe_loader(self, param, loaded_weight)
+            _vpe.VocabParallelEmbedding.weight_loader = _patched_vpe_loader
+
+            # 3) Catch-all: patch torch.Tensor.copy_ to assign _elem directly
+            #    when dst is a torchax tensor or a torchax View.
+            from torchax.view import View as _TxView
+            _orig_copy_ = torch.Tensor.copy_
+            def _patched_copy_(self, other, non_blocking=False):
+                if isinstance(self, _TxView):
+                    if hasattr(other, "_elem"):
+                        self.update(other._elem)
+                    else:
+                        _t = other.detach()
+                        if _t.dtype == torch.bfloat16:
+                            _t = _t.float()
+                        self.update(_jnp_load.asarray(
+                            _np_load.asarray(_t), dtype=self.jax().dtype
+                        ))
+                    return self
+                if hasattr(self, "_elem"):
+                    if hasattr(other, "_elem"):
+                        self._elem = other._elem.astype(self._elem.dtype)
+                    else:
+                        _direct_assign(self, other)
+                    return self
+                return _orig_copy_(self, other, non_blocking=non_blocking)
+            torch.Tensor.copy_ = _patched_copy_
+
+            # 4) Patch torch.Tensor.narrow to return a View instead of a
+            #    detached slice for torchax tensors, so the subsequent
+            #    .copy_ propagates writes back to the parent param.
+            from torchax.view import NarrowInfo as _NarrowInfo
+            _orig_narrow = torch.Tensor.narrow
+            def _patched_narrow(self, dim, start, length):
+                if hasattr(self, "_elem") or isinstance(self, _TxView):
+                    # Build a tuple of slices for the View
+                    slices = [slice(None)] * self.ndim
+                    slices[dim] = slice(start, start + length)
+                    return _TxView(self, view_info=_NarrowInfo(tuple(slices)),
+                                   env=self._env)
+                return _orig_narrow(self, dim, start, length)
+            torch.Tensor.narrow = _patched_narrow
+        else:
+            _load_ctx = contextlib.nullcontext()
         with self.memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
-        ):
+        ), _load_ctx:
             self.loader = get_model_loader(
                 load_config=self.load_config,
                 model_config=self.model_config,
@@ -1315,6 +1463,50 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
                 )
+            # PROBE 0.5: weight sanity sweep.
+            import os as _probe05_os
+            if _probe05_os.environ.get("SGLANG_PROBE0_5") or _probe05_os.environ.get("SGLANG_PROBE0"):
+                try:
+                    import jax.numpy as _jnp_p05
+                    _all_params = dict(self.model.named_parameters())
+                    # 3 canonical spot-checks + a sweep for any all-zero param.
+                    _spot = [
+                        "model.embed_tokens.weight",
+                        "lm_head.weight",
+                        "model.layers.15.self_attn.qkv_proj.weight",
+                        "model.layers.15.mlp.gate_up_proj.weight",
+                        "model.layers.15.self_attn.o_proj.weight",
+                        "model.layers.15.mlp.down_proj.weight",
+                        "model.layers.15.input_layernorm.weight",
+                        "model.layers.15.post_attention_layernorm.weight",
+                        "model.norm.weight",
+                    ]
+                    for _k in _spot:
+                        if _k in _all_params:
+                            _p = _all_params[_k]
+                            _arr = _p._elem if hasattr(_p, "_elem") else None
+                            if _arr is None:
+                                logger.warning("PROBE0_5 %s no _elem", _k)
+                                continue
+                            _mean = float(_arr.mean())
+                            _std = float(_arr.std())
+                            _abs_mean = float(_jnp_p05.abs(_arr).mean())
+                            _all_zero = bool((_arr == 0).all())
+                            logger.warning(
+                                "PROBE0_5 %s shape=%s mean=%.6f std=%.6f abs_mean=%.6f all_zero=%s",
+                                _k, tuple(_arr.shape), _mean, _std, _abs_mean, _all_zero,
+                            )
+                    # Sweep: any all-zero params anywhere?
+                    _zero_names = []
+                    for _k, _p in _all_params.items():
+                        if hasattr(_p, "_elem"):
+                            if bool((_p._elem == 0).all()):
+                                _zero_names.append(_k)
+                    logger.warning("PROBE0_5 zero_param_count=%d names=%s",
+                        len(_zero_names), _zero_names[:20])
+                except Exception as _e_p05:
+                    import traceback as _tb_p05
+                    logger.warning("PROBE0_5 failed: %s\n%s", _e_p05, _tb_p05.format_exc())
         # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
         if _is_npu:
@@ -1403,12 +1595,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dumper.register_non_intrusive_dumper(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
-        reserve_rope_cache_for_long_sequences(
-            self.model,
-            self.server_args,
-            self.model_config,
-            logger,
-        )
+        # Skip on TPU: the call does `.to(device='jax')` outside
+        # default_env() and trips aten::empty_strided.
+        # JaxStepRunner's JIT handles RoPE eagerly per step anyway.
+        if not current_platform.is_tpu():
+            reserve_rope_cache_for_long_sequences(
+                self.model,
+                self.server_args,
+                self.model_config,
+                logger,
+            )
 
         if self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
@@ -2990,6 +3186,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # In-tree TPU short-circuit (plan §S1.5 row 9, kb §12.4): route
+        # decode through the JaxStepRunner's single jax.jit'd step. Built
+        # lazily so model_runner doesn't import JaxStepRunner unless we
+        # really are on TPU. self.device == "jax" because apply_server_args
+        # _defaults rewrote 'tpu' to 'jax' (decisions/2026-05-30).
+        if self.device == "jax":
+            if getattr(self, "_jax_step_runner", None) is None:
+                from sglang.srt.model_executor.jax_step_runner import (
+                    JaxStepRunner,
+                )
+
+                self._jax_step_runner = JaxStepRunner(self)
+            return self._jax_step_runner.step(forward_batch)
+
         # Set extra arguments
         pdmux_override = False
         if not skip_attn_backend_init:
@@ -3041,6 +3251,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Tuple[
         Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
     ]:
+        # In-tree TPU short-circuit (plan §S1.5 row 9, kb §12.4, risk #31):
+        # extend MUST go through a JIT vehicle or torchax retraces every
+        # batch -> OOM. Same JaxStepRunner as decode; the runner routes
+        # via the RPA-v3 distribution triple inside the JIT body. Return
+        # (output, False) — second element is `can_run_graph`, which is
+        # irrelevant here (graph capture path is disabled on TPU).
+        # self.device == "jax" — see decisions/2026-05-30 rewrite.
+        if self.device == "jax":
+            if getattr(self, "_jax_step_runner", None) is None:
+                from sglang.srt.model_executor.jax_step_runner import (
+                    JaxStepRunner,
+                )
+
+                self._jax_step_runner = JaxStepRunner(self)
+            return (self._jax_step_runner.step(forward_batch), False)
+
         # Setup extra arguments
         kwargs = {}
         if self.support_pp:

@@ -114,6 +114,10 @@ def flatten_arrays_to_int64_tensor(
     cpu_t = torch.from_numpy(combined)
     if pin:
         cpu_t = cpu_t.pin_memory()
+    # TPU: torch.empty(...).to(device='jax') fails outside torchax.default_env.
+    # Keep on CPU; JaxStepRunner moves to JAX with jax_view at step entry.
+    if isinstance(device, str) and device == "jax":
+        return cpu_t
     return cpu_t.to(device, non_blocking=True)
 
 
@@ -172,6 +176,19 @@ def is_npu() -> bool:
         )
 
     return True
+
+
+@lru_cache(maxsize=1)
+def is_tpu() -> bool:
+    """Detect a TPU host via /dev/vfio/0 (cheap, no libtpu touch).
+
+    Calling `jax.devices()` here would (a) initialise libtpu in every
+    process that imports a sglang module, racing scheduler workers
+    against each other, and (b) miss when JAX_PLATFORMS=cpu is set in
+    the env for non-model workers."""
+    import os
+
+    return os.path.exists("/dev/vfio/0")
 
 
 @lru_cache(maxsize=1)
@@ -393,7 +410,8 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    # 'jax' = our TPU backend; no Triton.
+    return backend not in ["torch_native", "intel_amx", "jax"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -649,7 +667,7 @@ def get_available_gpu_memory(
     else:
         from sglang.srt.platforms import current_platform
 
-        if not current_platform.is_out_of_tree():
+        if not (current_platform.is_out_of_tree() or current_platform.is_tpu()):
             raise ValueError(
                 f"Unsupported device type: {device!r}. "
                 "If this is an OOT platform, ensure it is properly registered "
@@ -2037,7 +2055,15 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "mps"
         return "mps:{}".format(device_id)
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available.")
+    if is_tpu():
+        # Internal canonical device name is "jax" — torchax claims
+        # PrivateUse1 as "jax" so torch.device("jax") works; "tpu" would
+        # fail torch 2.11's allow-list. See decisions/2026-05-30...
+        if device_id is None:
+            return "jax"
+        return "jax:{}".format(device_id)
+
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS, TPU) is available.")
 
 
 @lru_cache(maxsize=1)
@@ -2107,6 +2133,12 @@ def get_compiler_backend(mode=None) -> str:
 
     if current_platform.is_out_of_tree():
         return current_platform.get_compile_backend(mode)
+
+    # In-tree TPU: torch.compile is replaced with identity in
+    # TpuSRTPlatform.init_backend(); "eager" is a safety net for any call
+    # site that has imported the backend name before init_backend runs.
+    if is_tpu():
+        return "eager"
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"

@@ -20,6 +20,7 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
+from sglang.srt.platforms.tpu import TpuSRTPlatform, is_tpu_available
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,16 @@ def _resolve_platform() -> SRTPlatform:
             logger.exception("Failed to activate platform plugin: %s", name)
 
     if len(activated) == 0:
+        # TPU first — env var SGLANG_FORCE_TPU=1 bypasses jax.devices() probe,
+        # which fails in some spawned scheduler workers where libtpu hasn't
+        # been initialized yet. The parent always inits it.
+        import os as _os
+        if _os.environ.get("SGLANG_FORCE_TPU") == "1" or is_tpu_available():
+            logger.debug(
+                "Using TPU SRTPlatform "
+                "(SGLANG_FORCE_TPU=1 or jax.devices() reports a TpuDevice)."
+            )
+            return TpuSRTPlatform()
         if _is_cuda_available():
             logger.debug(
                 "No platform plugin detected. Using CUDA SRTPlatform defaults."

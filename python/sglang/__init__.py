@@ -1,5 +1,9 @@
 # SGLang public APIs
 
+# NOTE: spawned workers inherit JAX_PLATFORMS=cpu from the parent.
+# Tokenizer / Detokenizer / Router never need TPU and should keep it.
+# Only ModelRunner.__init__ flips it to 'tpu' (see model_runner.py).
+
 # Install stubs early for platforms where certain dependencies are unavailable
 # (e.g. macOS/MPS has no triton, and torch.mps lacks Stream / set_device /
 # get_device_properties).  This must run before any downstream imports.
